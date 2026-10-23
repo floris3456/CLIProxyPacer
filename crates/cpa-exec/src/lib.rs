@@ -85,6 +85,7 @@ mod replay;
 #[cfg(test)]
 mod test_tls;
 mod tls;
+pub mod token_identity;
 mod tokenizer;
 mod tokens;
 mod translate;
@@ -443,15 +444,14 @@ impl Executors {
     }
 
     /// [`Self::prepare`] for a credential whose access token an upstream rejected, or a
-    /// management refresh: Codex refreshes even when not due (Go marks the token rejected
-    /// or forces the refresh). Other providers prepare as usual; most of them (Claude
-    /// once its identity is known, Kimi, Meta, Devin) refresh whenever asked.
+    /// management refresh. A rejection requires a real refresh even when the token has
+    /// not expired and identity or project discovery is still pending.
     pub async fn prepare_forced(&self, credential: &Credential, cfg: &Config) -> Result<MetadataPatch, ExecError> {
+        proxy::Proxy::effective(credential, cfg).validate()?;
         match credential.provider.as_str() {
-            "codex" => {
-                proxy::Proxy::effective(credential, cfg).validate()?;
-                self.codex.refresh_now(credential, cfg).await
-            }
+            "claude" => self.claude.prepare_forced(credential, cfg).await,
+            "codex" => self.codex.refresh_now(credential, cfg).await,
+            antigravity::PROVIDER => self.google.antigravity.prepare_forced(credential, cfg).await,
             _ => self.prepare(credential, cfg).await,
         }
     }

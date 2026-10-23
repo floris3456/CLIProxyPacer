@@ -538,23 +538,14 @@ impl XaiAuth {
             }
             "expired_token" => return Err(fail("xai device code expired".into())),
             "access_denied" => return Err(auth_error(403, "xai device authorization denied")),
-            other => {
-                let description = wire.s("error_description");
-                let description = description.trim();
-                return Err(fail(if description.is_empty() {
-                    format!("xai device token error: {other}")
-                } else {
-                    format!("xai device token error: {other}: {description}")
-                }));
-            }
+            // Unknown codes and descriptions may echo device codes or issued tokens.
+            // Known polling control codes above keep their existing state transitions.
+            _ => return Err(fail("xai device token exchange failed".into())),
         }
         if status != 200 {
             return Err(auth_error(
                 502,
-                format!(
-                    "xai device token request failed with status {status}: {}",
-                    String::from_utf8_lossy(&body).trim()
-                ),
+                format!("xai device token request failed with status {status}"),
             ));
         }
         if wire.s("access_token").trim().is_empty() {
@@ -996,9 +987,11 @@ pub(crate) async fn login_with(auth: XaiAuth, auth_dir: &Path, no_browser: bool)
     let target = path.clone();
     let metadata = record.metadata;
     tokio::task::spawn_blocking(move || {
-        let existing = std::fs::read(&target).ok().filter(|raw| !raw.is_empty());
+        let file = crate::codex_siwc_bind::CredentialFileLease::acquire_for_write(&target)
+            .map_err(|_| auth_error(500, "xai: cannot lock credential file"))?;
+        let existing = std::fs::read(file.path()).ok().filter(|raw| !raw.is_empty());
         let document = GoValue::Object(saved_document(metadata, existing.as_deref()).map_err(|e| auth_error(500, e))?);
-        crate::kimi_auth::write_private(&target, &document.encode_indented())
+        crate::kimi_auth::write_private(file.path(), &document.encode_indented())
             .map_err(|_| auth_error(500, "xai: cannot write credential file"))
     })
     .await

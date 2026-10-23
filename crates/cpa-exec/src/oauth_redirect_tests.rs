@@ -1,5 +1,6 @@
 //! Credential POSTs must not replay secrets at a redirect destination. These exercise
-//! public acquisition paths with a second loopback server as the redirect recipient.
+//! public acquisition paths and Devin's credential-bearing inference protobuf with a
+//! second loopback server as the redirect recipient.
 
 use std::future::Future;
 use std::time::Duration;
@@ -138,6 +139,32 @@ async fn devin_account_status_does_not_redirect_its_session_token() {
                 .fetch_user_status("permanent-session-token", "test-device")
                 .await
                 .map(|_| ())
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn devin_inference_does_not_redirect_its_embedded_session_token() {
+    rejects_secret_redirect(
+        crate::devin_wire::CHAT_PATH,
+        "permanent-session-token",
+        |client, origin| async move {
+            let fixture = crate::kimi_fixture::fixture("devin", "interactions-nonstream");
+            let mut credential = crate::kimi_fixture::credential("devin", &fixture, None);
+            credential.attributes.insert("base_url".into(), origin);
+            credential
+                .attributes
+                .insert("api_key".into(), "permanent-session-token".into());
+            let request = crate::kimi_fixture::request(&fixture, "redirect-test");
+            crate::devin::DevinExecutor::with_client(client)
+                .execute(&credential, request, &cpa_core::config::Config::default())
+                .await
+                .map(|_| ())
+                .map_err(|error| {
+                    assert_eq!(error.status, 502);
+                    String::from_utf8_lossy(&error.body).into_owned()
+                })
         },
     )
     .await;

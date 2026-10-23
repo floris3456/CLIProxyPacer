@@ -264,7 +264,27 @@ impl AntigravityExecutor {
     /// Credential preparation, then Go's post-refresh credits lookup
     /// (`queueAntigravityCreditsRefresh` after `refreshToken`).
     pub async fn prepare(&self, credential: &Credential, cfg: &Config) -> Result<MetadataPatch, ExecError> {
-        let patch = auth::prepare(&self.clients_for(credential, cfg), credential, cfg).await?;
+        self.prepare_with(credential, cfg, false).await
+    }
+
+    /// A rejected token or explicit management refresh must rotate before project
+    /// discovery, even if its expiry still says it is fresh.
+    pub async fn prepare_forced(&self, credential: &Credential, cfg: &Config) -> Result<MetadataPatch, ExecError> {
+        self.prepare_with(credential, cfg, true).await
+    }
+
+    async fn prepare_with(
+        &self,
+        credential: &Credential,
+        cfg: &Config,
+        force_refresh: bool,
+    ) -> Result<MetadataPatch, ExecError> {
+        let clients = self.clients_for(credential, cfg);
+        let patch = if force_refresh {
+            auth::prepare_forced(&clients, credential, cfg).await?
+        } else {
+            auth::prepare(&clients, credential, cfg).await?
+        };
         if let Some(token) = patch.set.get("access_token").and_then(serde_json::Value::as_str) {
             let mut current = credential.clone();
             for (key, value) in &patch.set {

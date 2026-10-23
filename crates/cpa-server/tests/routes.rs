@@ -560,6 +560,7 @@ async fn anthropic_model_list_cloaking_reads_the_shared_setting() {
                 .unwrap()
                 .clone(),
             revision: 0,
+            parsed_by_plugin: false,
             next_refresh_after: None,
         };
         let p = proxy(config, vec![key]).await;
@@ -608,6 +609,7 @@ async fn config_models_alias_and_force_mapping_reach_upstream_and_client() {
             .unwrap()
             .clone(),
         revision: 0,
+        parsed_by_plugin: false,
         next_refresh_after: None,
     };
     key.attributes.insert("prefix".into(), "team".into());

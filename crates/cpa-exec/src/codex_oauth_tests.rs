@@ -146,6 +146,36 @@ async fn exchange_and_refresh_wire_and_results_match_go() {
 }
 
 #[tokio::test]
+async fn authorization_code_errors_never_echo_endpoint_secrets() {
+    let mock = Mock::start().await;
+    let oauth = oauth(&mock).await;
+    for (status, body) in [
+        (
+            400,
+            r#"{"error":"private_code","error_description":"private_verifier","access_token":"private_access","refresh_token":"private_refresh"}"#,
+        ),
+        (503, "private_code private_verifier private_access private_refresh"),
+    ] {
+        mock.script("/oauth/token", vec![json(status, body)]);
+        let error = oauth
+            .exchange("private_code", &redirect_uri(DEFAULT_CALLBACK_PORT), "private_verifier")
+            .await
+            .unwrap_err();
+        assert_eq!(error.status, status);
+        assert_eq!(error.scope, FailureScope::Credential);
+        assert_eq!(
+            &error.body[..],
+            format!("token exchange failed with status {status}").as_bytes()
+        );
+        let requests = mock.take();
+        assert_eq!(requests.len(), 1);
+        let sent = String::from_utf8_lossy(&requests[0].body);
+        assert!(sent.contains("code=private_code"));
+        assert!(sent.contains("code_verifier=private_verifier"));
+    }
+}
+
+#[tokio::test]
 async fn oauth_redirects_never_receive_codes_verifiers_or_refresh_tokens() {
     use crate::codex_testkit::Reply;
 

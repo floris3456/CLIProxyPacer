@@ -726,6 +726,25 @@ pub(crate) async fn prepare(
     credential: &Credential,
     cfg: &Config,
 ) -> Result<MetadataPatch, ExecError> {
+    prepare_with(clients, credential, cfg, false).await
+}
+
+/// Go `Refresh`: refresh even if the existing token appears fresh. Project discovery
+/// uses the replacement token, and its failure cannot discard successful rotation.
+pub(crate) async fn prepare_forced(
+    clients: &GoClients,
+    credential: &Credential,
+    cfg: &Config,
+) -> Result<MetadataPatch, ExecError> {
+    prepare_with(clients, credential, cfg, true).await
+}
+
+async fn prepare_with(
+    clients: &GoClients,
+    credential: &Credential,
+    cfg: &Config,
+    force_refresh: bool,
+) -> Result<MetadataPatch, ExecError> {
     let oauth = OAuth::new(clients.get_checked(&Proxy::effective(credential, cfg))?);
     let now = Utc::now();
     let mut patch = MetadataPatch::default();
@@ -744,7 +763,7 @@ pub(crate) async fn prepare(
             }
         }
     };
-    let refreshed = !missing || access.is_empty() || !fresh;
+    let refreshed = force_refresh || !missing || access.is_empty() || !fresh;
     if refreshed {
         let refresh = meta_string(credential, "refresh_token");
         if refresh.is_empty() {
@@ -762,12 +781,12 @@ pub(crate) async fn prepare(
     // A refresh already tried the lookup (ensureAntigravityProjectID, failure logged);
     // PrepareRequestAuth then looks again and reports its own outcome.
     let mut project = lookup(access.clone()).await;
-    if refreshed {
+    if refreshed && !force_refresh {
         match &project {
             Ok(found) if !found.is_empty() => {}
             Ok(_) => project = lookup(access.clone()).await,
             Err(error) => {
-                tracing::warn!("antigravity executor: ensure project id failed: {error}");
+                tracing::warn!(status = error.status, "antigravity executor: ensure project id failed");
                 project = lookup(access.clone()).await;
             }
         }
@@ -775,6 +794,16 @@ pub(crate) async fn prepare(
     match project {
         Ok(project) if !project.is_empty() => {
             patch.set.insert("project_id".into(), Value::String(project));
+            Ok(patch)
+        }
+        // Token rotation has already consumed the grant. Publish it before the next
+        // project-only preparation, which can report its failure without losing tokens.
+        // This intentionally differs from Go PrepareRequestAuth's all-or-error result.
+        result if refreshed => {
+            tracing::warn!(
+                status = result.err().and_then(|error| error.status),
+                "antigravity project discovery failed after token rotation; retaining rotated tokens"
+            );
             Ok(patch)
         }
         Ok(_) => Err(missing_project(None)),
@@ -1008,7 +1037,10 @@ pub async fn login(auth_dir: &Path, cfg: &Config, options: &LoginOptions) -> Res
             .and_then(Value::as_str)
             .unwrap_or("antigravity")
             .to_owned();
-        let path = write_login(auth_dir, &file_name, &metadata)?;
+        let auth_dir = auth_dir.to_owned();
+        let path = tokio::task::spawn_blocking(move || write_login(&auth_dir, &file_name, &metadata))
+            .await
+            .map_err(|_| "antigravity: credential publication failed".to_owned())??;
         Ok((path, label))
     }
     .await;

@@ -563,10 +563,9 @@ mod tests {
         }
     }
 
-    /// Go publishes a refresh's `LastRefreshedAt` with the refreshed auth, under one
-    /// lock: a reload that disables the credential and one that enables it again, both
-    /// landing after the commit, leave the schedule of their registration (no last
-    /// refresh), and a refresh from an earlier registration of the ID writes nothing.
+    /// A published refresh includes its schedule and rotation timestamp. Subsequent
+    /// reloads that disable and enable the credential leave their own schedule (no
+    /// last refresh), and a refresh from an earlier registration writes nothing.
     #[test]
     fn a_refresh_commit_publishes_its_schedule_with_the_credential() {
         let dir = std::env::temp_dir().join(format!("cpa-refresh-commit-{}", uuid::Uuid::new_v4()));
@@ -588,24 +587,29 @@ mod tests {
             registered,
             plugin: true,
         };
-        let (committed, _) = store
-            .apply_refresh(
-                "a.json",
-                current.revision,
-                fence,
-                &patch,
-                |_| {},
-                |_| {
-                    // Both reloads land after the commit, before the writer returns.
-                    assert!(schedule().last.is_some(), "recorded with the commit");
-                    for disabled in [true, false] {
-                        store.reconcile(vec![credential("p2", disabled)]);
-                    }
-                    true
-                },
-            )
+        let published = store.subscribe();
+        let (committed, rotated) = store
+            .apply_refresh("a.json", current.revision, fence, &patch, |_| {}, |_| true, None)
             .unwrap();
+        assert!(rotated);
+        assert!(published.has_changed().unwrap(), "the refresh published a change");
+        assert_eq!(store.get("a.json").unwrap().revision, committed.revision);
         assert_eq!(committed.metadata["access_token"], "p2");
+        assert!(schedule().last.is_some(), "recorded with the commit");
+        assert_eq!(
+            store
+                .unauthorized()
+                .refreshed
+                .get("a.json")
+                .map(|(revision, _)| *revision),
+            Some(committed.revision),
+            "rotation timestamp belongs to the published revision"
+        );
+        // The rotation predicate runs before publication; observe the completed
+        // commit before issuing reloads instead of using that predicate as a hook.
+        for disabled in [true, false] {
+            store.reconcile(vec![credential("p2", disabled)]);
+        }
         assert!(!store.get("a.json").unwrap().disabled);
         assert_eq!(schedule().last, None, "the enabling reload's own");
         // Registered again under its ID: the earlier registration's refresh is refused
@@ -613,7 +617,7 @@ mod tests {
         store.reconcile(vec![]);
         store.reconcile(vec![credential("q", false)]);
         let current = store.get("a.json").unwrap();
-        let refused = store.apply_refresh("a.json", current.revision, fence, &patch, |_| {}, |_| true);
+        let refused = store.apply_refresh("a.json", current.revision, fence, &patch, |_| {}, |_| true, None);
         assert!(
             matches!(refused, Err(crate::runtime::PatchError::NotFound)),
             "{refused:?}"

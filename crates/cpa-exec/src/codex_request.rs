@@ -1839,6 +1839,7 @@ mod tests {
                 .cloned()
                 .unwrap(),
             revision: 0,
+            parsed_by_plugin: false,
             next_refresh_after: None,
         };
         let settings = |c: &Credential| Settings {

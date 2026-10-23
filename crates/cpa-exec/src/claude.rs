@@ -201,6 +201,14 @@ impl ClaudeExecutor {
         self.oauth.prepare(credential, &Proxy::effective(credential, cfg)).await
     }
 
+    /// A provider-rejected token must rotate even when its expiry is still valid
+    /// and missing identity would otherwise select profile-only preparation.
+    pub async fn prepare_forced(&self, credential: &Credential, cfg: &Config) -> Result<MetadataPatch, ExecError> {
+        self.oauth
+            .refresh_credential(credential, &Proxy::effective(credential, cfg))
+            .await
+    }
+
     fn native_client(&self, proxy: &Proxy, handshake: Option<std::time::Duration>) -> Result<wreq::Client, ExecError> {
         proxy.validate()?;
         match &self.native {
@@ -549,6 +557,7 @@ impl ClaudeExecutor {
                 body = rebuild_mid_system(&body);
             }
             let body = sanitize_for_upstream(body, &ctx.base_model, ctx.is_compat);
+            let body = preserved_thinking_binding(body);
             let body = cloak::strip_prompt_cache_options(ctx.count_rules(&req, body, &original));
             return Ok(ExecResponse {
                 status: 200,
@@ -1071,7 +1080,7 @@ impl<'a> Ctx<'a> {
         } else {
             own
         };
-        let api_key_kind = attr("auth_kind") == "apikey";
+        let api_key_kind = cpa_core::registry::dynamic::is_api_key(credential);
         let bearer = oauth_token || (!api_key_kind && attr("api_key").trim().is_empty());
         let base = base_model(&req.model);
         // Go `cliproxyauth.ResolvedModelInfo(req)`, bound by dispatch per attempt.
@@ -1464,6 +1473,7 @@ impl<'a> Ctx<'a> {
         if self.compaction_summary {
             body = compaction::finalize(body);
         }
+        body = preserved_thinking_binding(body);
         // 868e137: the payload rules match the fully prepared body and apply once. Only
         // header extraction, signing and read-only checks follow.
         let (edited, touched) = cpa_common::payload::apply_tracked(
@@ -1610,6 +1620,7 @@ impl<'a> Ctx<'a> {
             body = alias::remap(&body, secret).0;
         }
         body = sanitize_for_upstream(body, &self.base_model, self.is_compat);
+        body = preserved_thinking_binding(body);
         body = cloak::strip_prompt_cache_options(body);
         if self.first_party || self.cli_profile {
             for field in ["metadata", "context_management", "diagnostics"] {
@@ -1945,6 +1956,60 @@ fn disable_thinking_if_tool_choice_forced(body: String) -> String {
         body = rawjson::delete(&body, "output_config");
     }
     body
+}
+
+/// Go `applyClaudePreservedThinkingBinding`: replay the blocks unchanged, but let
+/// Anthropic drop prefix-bound history on a mismatch instead of rejecting the turn.
+/// Caller choices and the payload rules applied after this helper keep precedence.
+fn preserved_thinking_binding(mut body: String) -> String {
+    let model = cloak::canonical_model(rawjson::get(&body, "model").str());
+    let variant = |name: &str| {
+        model == name
+            || model
+                .strip_prefix(name)
+                .is_some_and(|suffix| suffix.starts_with('-') || suffix.starts_with('['))
+    };
+    let adaptive_only = variant("claude-sonnet-5-5") || variant("claude-haiku-5-5") || variant("claude-haiku-5.5");
+    let fable = ["fable-5-1", "fable-5.1"].iter().any(|name| {
+        model.find(name).is_some_and(|start| {
+            model
+                .as_bytes()
+                .get(start + name.len())
+                .is_none_or(|b| !b.is_ascii_digit())
+        })
+    });
+    let preserved = adaptive_only || model == "claude-opus-5-5" || model.starts_with("claude-opus-5-5[") || fable;
+    if !preserved || matches!(rawjson::get(&body, "tool_choice.type").str(), "any" | "tool") {
+        return body;
+    }
+    let thinking = rawjson::get(&body, "thinking");
+    if thinking.exists() {
+        let mode = thinking.get("type").str().trim().go_lower();
+        if !(mode == "adaptive" || (mode == "enabled" && !adaptive_only))
+            || thinking.get("block_binding.prefix_mismatch_behavior").exists()
+        {
+            return body;
+        }
+    }
+    let mut signed_history = false;
+    rawjson::get(&body, "messages").each(|_, message| {
+        message.get("content").each(|_, block| {
+            signed_history = match block.get("type").str().trim() {
+                "thinking" => !block.get("signature").str().trim().is_empty(),
+                "redacted_thinking" => !block.get("data").str().trim().is_empty(),
+                _ => false,
+            };
+            !signed_history
+        });
+        !signed_history
+    });
+    if !signed_history {
+        return body;
+    }
+    if !thinking.exists() {
+        body = rawjson::set_str(&body, "thinking.type", "adaptive");
+    }
+    rawjson::set_str(&body, "thinking.block_binding.prefix_mismatch_behavior", "drop_block")
 }
 
 /// `normalizeClaudeSamplingForUpstream`.

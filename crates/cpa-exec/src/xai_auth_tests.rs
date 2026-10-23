@@ -241,6 +241,15 @@ async fn login_matches_go_manager_and_file_store() {
                 let want = case["error"]
                     .as_str()
                     .unwrap_or_else(|| panic!("{name}: Rust failed with {got}"));
+                // Deliberate credential redaction: device-token endpoint messages
+                // can echo the posted device code or issued tokens. Wire fixtures stay.
+                let want = match name {
+                    "token_error_with_description" | "token_error_without_description" => {
+                        "xai: xai device token exchange failed"
+                    }
+                    "token_status_without_error_field" => "xai: xai device token request failed with status 500",
+                    _ => want,
+                };
                 if SYNTAX_MESSAGE.contains(&name) {
                     let prefix = want.split("parse response: ").next().unwrap();
                     assert!(got.starts_with(prefix), "{name}: {got} vs {want}");
@@ -379,6 +388,33 @@ async fn slow_down_adds_the_poll_step() {
     let plain = XaiAuth::new(crate::proxy::default_client());
     assert_eq!(plain.exchange(&endpoint, "d", &mut interval).await.unwrap(), None);
     assert_eq!(interval, Duration::from_millis(5011));
+}
+
+#[tokio::test]
+async fn device_poll_errors_hide_endpoint_secrets() {
+    let script = serde_json::json!([
+        {"path":"/t", "status":400, "body":r#"{"error":"echoed-device-secret","error_description":"echoed-access-secret"}"#},
+        {"path":"/t", "status":500, "body":r#"{"access_token":"echoed-access-secret","message":"echoed-device-secret"}"#}
+    ]);
+    let mock = Mock::start(&script).await;
+    let endpoint = format!("http://{}/t", mock.addr);
+    let auth = mock.auth();
+    let mut interval = Duration::from_millis(1);
+    let error = auth
+        .exchange(&endpoint, "test-device-code", &mut interval)
+        .await
+        .unwrap_err();
+    assert_eq!(error.status, 400);
+    assert_eq!(&error.body[..], b"xai device token exchange failed");
+    let error = auth
+        .exchange(&endpoint, "test-device-code", &mut interval)
+        .await
+        .unwrap_err();
+    assert_eq!(error.status, 502);
+    assert_eq!(&error.body[..], b"xai device token request failed with status 500");
+    let requests = mock.requests();
+    assert_eq!(requests.len(), 2);
+    assert!(requests.iter().all(|r| r.contains("device_code=test-device-code")));
 }
 
 #[test]

@@ -35,6 +35,10 @@ pub struct Credential {
     pub attributes: BTreeMap<String, String>,
     /// The full credential JSON. Source of truth for provider fields.
     pub metadata: Map<String, Value>,
+    /// The file was interpreted by a plugin auth parser. Its raw JSON may use a
+    /// different schema or provider from this credential. Internal provenance only;
+    /// never included in plugin attributes or persisted metadata.
+    pub parsed_by_plugin: bool,
     /// Store-wide monotonic stamp set on every accepted change, never reused even after
     /// a delete and re-create. Patches against an old revision are rejected.
     pub revision: u64,
@@ -62,6 +66,7 @@ impl Credential {
             attributes: BTreeMap::from([("runtime_only".to_owned(), "true".to_owned())]),
             metadata,
             revision: 0,
+            parsed_by_plugin: false,
             next_refresh_after: None,
         }
     }
@@ -91,6 +96,7 @@ impl Credential {
             attributes: BTreeMap::new(),
             metadata,
             revision: 0,
+            parsed_by_plugin: false,
             next_refresh_after: None,
         };
         cred.refresh_derived();

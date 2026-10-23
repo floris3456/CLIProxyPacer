@@ -17,7 +17,7 @@ Columns:
 | Claude: prompt cache and prompt shaping | 10 | 6 | 0 | 0 | 1 | 3 |
 | Claude: thread continuation | 4 | 4 | 0 | 0 | 0 | 0 |
 | Claude: rate limits and error answers | 2 | 2 | 0 | 0 | 0 | 0 |
-| Claude: other executor work | 13 | 5 | 8 | 0 | 0 | 0 |
+| Claude: other executor work | 13 | 9 | 4 | 0 | 0 | 0 |
 | Claude: Responses tool_search | 13 | 0 | 13 | 0 | 0 | 0 |
 | Translation to and from Claude | 17 | 13 | 4 | 0 | 0 | 0 |
 | Payload rules | 1 | 1 | 0 | 0 | 0 | 0 |
@@ -37,7 +37,7 @@ Columns:
 | Go tests only | 7 | 0 | 0 | 0 | 7 | 0 |
 | Merge commits | 32 | 0 | 0 | 0 | 32 | 0 |
 | Reasoning signature carriage | 8 | 0 | 8 | 0 | 0 | 0 |
-| **All** | **288** | **89** | **133** | **0** | **63** | **3** |
+| **All** | **288** | **93** | **129** | **0** | **63** | **3** |
 
 Suggested order: credential epochs, watcher reconciliation and cooldown fencing first; SIWC security and v8 config concurrency next; plugin model/auth wiring and Home integration alongside them. Port the shared schema cleaner and reasoning-signature carriage series together, then Codex SSE/tool history, Gemini/Vertex tools and OpenAPI models, and the remaining providers. Keep the Antigravity entitlement/probe series (7e857c37, 9521fe29, ad381435, 091ff27f) together. Keep the Claude payload barrier (868e137), Responses tool_search series and deferred-tool cache fix (97ba1e89) together; verify stable prefixes before changing cache semantics. Finish the remaining Claude thinking/date/web-search cache work and catalogs, then SDK, discovery and non-visible performance parity. Sizes are Go diff sizes, not priorities or Rust effort estimates.
 
@@ -82,12 +82,12 @@ Suggested order: credential epochs, watcher reconciliation and cooldown fencing 
 | [`0d18d3b3`](https://github.com/router-for-me/CLIProxyAPI/commit/0d18d3b3) | feat(claude): support model-specific default max tokens from registry in OpenAI chat completions | yes | ported here | M (+68 −4) | support model-specific default max tokens from registry in OpenAI chat completions; #75 |
 | [`345cc9d5`](https://github.com/router-for-me/CLIProxyAPI/commit/345cc9d5) | feat(claude): add timeout and retry logic for silent TLS handshakes | yes | ported here | L (+326 −8) | silent TLS handshake bound on the Claude Code and Chrome transports; the failure is a transport fault (retry, no cooldown); the bound also covers dialing (M4-0514) |
 | [`7604d3df`](https://github.com/router-for-me/CLIProxyAPI/commit/7604d3df) | feat(claude): add session date pin retention to preserve continuity across credential switches | yes | to port | L (+325 −19) | date-pin retention across credential switches and configurable retention; not just session-local pinning |
-| [`911f49cb`](https://github.com/router-for-me/CLIProxyAPI/commit/911f49cb) | feat(claude): add automatic thinking block binding and beta policy for preserved-thinking models | yes | to port | M (+103 −2) | preserved-thinking block binding and beta policy; followed by e13bc9a1 and ad9e456d |
-| [`e13bc9a1`](https://github.com/router-for-me/CLIProxyAPI/commit/e13bc9a1) | feat(claude): synthesize adaptive thinking block binding for preserved-thinking models | yes | to port | S (+22 −10) | synthesize adaptive thinking block binding for preserved-thinking models |
-| [`ad9e456d`](https://github.com/router-for-me/CLIProxyAPI/commit/ad9e456d) | feat(claude): support `between_tools` thinking disable type and adaptive fallbacks | yes | to port | M (+188 −57) | support `between_tools` thinking disable type and adaptive fallbacks |
+| [`911f49cb`](https://github.com/router-for-me/CLIProxyAPI/commit/911f49cb) | feat(claude): add automatic thinking block binding and beta policy for preserved-thinking models | yes | ported here | M (+103 −2) | preserved_thinking_binding_respects_models_modes_and_replayed_history and preserved_thinking_binding_reaches_all_header_profiles_before_operator_rules cover model/mode gates, the beta and final payload authority; history stays unchanged while drop_block permits provider-side prefix-mismatch recovery |
+| [`e13bc9a1`](https://github.com/router-for-me/CLIProxyAPI/commit/e13bc9a1) | feat(claude): synthesize adaptive thinking block binding for preserved-thinking models | yes | ported here | S (+22 −10) | the same preserved-thinking regressions cover adaptive synthesis only when thinking is absent; explicit modes/binding choices and forced tool use stay authoritative |
+| [`ad9e456d`](https://github.com/router-for-me/CLIProxyAPI/commit/ad9e456d) | feat(claude): support `between_tools` thinking disable type and adaptive fallbacks | yes | ported here | M (+188 −57) | between_tools and adaptive fallback already covered by cpa-common thinking_off_on_claude_models_that_refuse_disabled and the v8.0.35 thinking matrix (M1-0151) |
 | [`db1bab01`](https://github.com/router-for-me/CLIProxyAPI/commit/db1bab01) | feat(runtime): narrow Claude per-minute rate-limit cooldown when short Retry-After is present | yes | ported here | M (+103 −2) | per-minute 429 narrowing; replays Go-recorded vectors (`tests/fixtures/claude_ratelimit_go.json`) |
 | [`9d453bc0`](https://github.com/router-for-me/CLIProxyAPI/commit/9d453bc0) | feat(cache): add Claude web search result caching and restoration for sessions | yes | to port | L (+508 −0) | session web-search result restoration and cache configuration; ab9c06b4 adds Home persistence |
-| [`084b9ca7`](https://github.com/router-for-me/CLIProxyAPI/commit/084b9ca7) | feat(claude): strip Claude Code identity on API keys with cloak mode never or uncloak | yes | to port | M (+139 −12) | cloak never/uncloak must remove Claude Code identity, not merely disable injected cloaking |
+| [`084b9ca7`](https://github.com/router-for-me/CLIProxyAPI/commit/084b9ca7) | feat(claude): strip Claude Code identity on API keys with cloak mode never or uncloak | yes | ported here | M (+139 −12) | provider_safety_uncloak_preserves_application_data_and_oauth_identity covers never/uncloak for API keys and required OAuth identity |
 | [`ab9c06b4`](https://github.com/router-for-me/CLIProxyAPI/commit/ab9c06b4) | feat(cache): add Home KV support to Claude web search result cache | yes | to port | M (+106 −17) | add Home KV support to Claude web search result cache |
 
 ## Claude: Responses tool_search

@@ -2623,3 +2623,257 @@ async fn provider_safety_native_helper_keeps_prompt_and_adds_selected_oauth_beta
     assert!(betas.split(',').any(|beta| beta == betas::OAUTH));
     assert!(!betas.split(',').any(|beta| beta == betas::EXTENDED_CACHE_TTL));
 }
+
+#[test]
+fn preserved_thinking_binding_respects_models_modes_and_replayed_history() {
+    let history = r#"[{"role":"assistant","content":[{"type":"redacted_thinking","data":"opaque+/=="}]},{"role":"user","content":"Continue"}]"#;
+    for (model, thinking, inject) in [
+        ("claude-opus-5-5", None, true),
+        ("claude-sonnet-5-5", None, true),
+        ("vendor/CLAUDE-HAIKU-5.5-20261001", None, true),
+        ("claude-haiku-5-5", Some(r#"{"type":"adaptive"}"#), true),
+        ("claude-fable-5.1", Some(r#"{"type":"enabled"}"#), true),
+        ("claude-mythos-5-1", Some(r#"{"type":"adaptive"}"#), false),
+        ("claude-opus-5", None, false),
+        ("claude-fable-5-10", None, false),
+        ("claude-haiku-5-5", Some(r#"{"type":"enabled"}"#), false),
+        ("claude-haiku-5-5", Some(r#"{"type":"disabled"}"#), false),
+        ("claude-sonnet-5-5", Some(r#"{"type":"between_tools"}"#), false),
+        ("claude-opus-5-5", Some("{}"), false),
+        (
+            "claude-opus-5-5",
+            Some(r#"{"type":"adaptive","block_binding":{"prefix_mismatch_behavior":"error"}}"#),
+            false,
+        ),
+    ] {
+        let mut body = format!(r#"{{"model":"{model}","messages":{history}}}"#);
+        if let Some(thinking) = thinking {
+            body = rawjson::set_raw(&body, "thinking", thinking);
+        }
+        let output = preserved_thinking_binding(body.clone());
+        if inject {
+            assert_eq!(
+                rawjson::string(&output, "thinking.block_binding.prefix_mismatch_behavior"),
+                "drop_block",
+                "{model}"
+            );
+            assert_eq!(rawjson::get(&output, "messages").json(), history);
+            if thinking.is_none() {
+                assert_eq!(rawjson::string(&output, "thinking.type"), "adaptive");
+            }
+        } else {
+            assert_eq!(output, body, "{model}: {thinking:?}");
+        }
+    }
+    for (block, inject) in [
+        (
+            r#"{"type":"thinking","thinking":"","signature":"verified-by-sanitizer"}"#,
+            true,
+        ),
+        (r#"{"type":"thinking","thinking":"unsigned"}"#, false),
+        (r#"{"type":"redacted_thinking","data":""}"#, false),
+    ] {
+        let body = format!(r#"{{"model":"claude-haiku-5-5","messages":[{{"role":"assistant","content":[{block}]}}]}}"#);
+        assert_eq!(
+            rawjson::get(&preserved_thinking_binding(body), "thinking.block_binding").exists(),
+            inject
+        );
+    }
+    for tool in ["any", "tool"] {
+        let body = format!(r#"{{"model":"claude-haiku-5-5","tool_choice":{{"type":"{tool}"}},"messages":{history}}}"#);
+        assert_eq!(preserved_thinking_binding(body.clone()), body);
+    }
+}
+
+#[tokio::test]
+async fn preserved_thinking_binding_reaches_all_header_profiles_before_operator_rules() {
+    let history = r#"[{"role":"user","content":"Question"},{"role":"assistant","content":[{"type":"redacted_thinking","data":"opaque+/=="},{"type":"text","text":"Answer"}]},{"role":"user","content":"Continue"}]"#;
+    for (yaml, binding, beta) in [
+        ("", "drop_block", true),
+        (
+            "requests:\n  payload:\n    override:\n      - models: [{name: claude-haiku-5-5}]\n        params: {thinking.block_binding.prefix_mismatch_behavior: error}\n",
+            "error",
+            true,
+        ),
+        (
+            "requests:\n  payload:\n    filter:\n      - models: [{name: claude-haiku-5-5}]\n        params: [thinking.block_binding]\n",
+            "",
+            false,
+        ),
+        (
+            "upstream:\n  claude:\n    header-defaults:\n      anthropic-beta-strip: [thinking-binding-controls-2026-08-01]\n",
+            "drop_block",
+            false,
+        ),
+    ] {
+        let cfg = safety_config(yaml);
+        for profile in ["oauth", "native-stream", "caller-count"] {
+            let mut credential = harness_credential();
+            let mut req = if profile == "native-stream" {
+                safety_native_request()
+            } else {
+                safety_request(false)
+            };
+            req.model = "claude-haiku-5-5".into();
+            req.requested_model = req.model.clone();
+            req.stream = profile == "native-stream";
+            let mut body = rawjson::set_str(&utf8(&req.body), "model", &req.model);
+            body = rawjson::set_raw(&body, "messages", history);
+            body = rawjson::set_raw(&body, "stream", if req.stream { "true" } else { "false" });
+            req.body = Bytes::from(body);
+            req.original_body = req.body.clone();
+            if profile == "caller-count" {
+                req.operation = Operation::CountTokens;
+                credential.attributes.insert("api_key".into(), "local-test-key".into());
+                credential.attributes.insert("cloak_mode".into(), "never".into());
+            }
+            let prepared = safety_prepare(&credential, &cfg, &req).await;
+            assert_eq!(
+                rawjson::string(&prepared.body, "thinking.block_binding.prefix_mismatch_behavior"),
+                binding,
+                "{profile}"
+            );
+            assert_eq!(
+                sent_header(&prepared, "anthropic-beta")
+                    .split(',')
+                    .any(|value| value == betas::THINKING_BINDING),
+                beta,
+                "{profile}"
+            );
+            assert_eq!(
+                rawjson::get(&prepared.body, "messages.1.content.0").json(),
+                r#"{"type":"redacted_thinking","data":"opaque+/=="}"#
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn native_opaque_thinking_roundtrips_with_thinking_disabled() {
+    use axum::response::IntoResponse;
+    // The syntactically valid fixture used by Go's preserved-thinking tests.
+    const SIGNATURE: &str = "CAISqwIKiAEIEBgCKkBHRlRBsNiptQUWfPoOhuQKwi5LnncZVO9bB5jqOs76D7uBtgktML0zqJtNmLHXHHcgD6lk4MQu4QBXzFd1lbC3Mg5jbGF1ZGUtZmFibGUtNTgBQgh0aGlua2luZ1okZDk3NDM5NzUtNGJiMC00OTM2LTllMjgtZDViMGQyMWJkYzQ4EgxCGh+XVFFFeySAjtAaDL/A1LltGu6MMJ+eXSIwsN0oBpDrqLv22UBfkMnTotnIbkvkOyb9xZHgigG6OZVHaI3gThm+maLKmgO5PrFLKlDFYp+YZksy/wKwszJlnLTPzAK+NUlfzagOE1ymtZTXhAYK260XyFYmg/te/C231+Fr/hoX+EJoUBnrn0gD7hqMISOT+TaFEuOXYsN517GfaxgB";
+    let content = serde_json::json!([
+        {"type":"thinking","thinking":"","signature":SIGNATURE},
+        {"type":"redacted_thinking","data":"opaque+/=="},
+        {"type":"text","text":"Answer"}
+    ]);
+    let reply = serde_json::json!({
+        "id":"msg_opaque", "type":"message", "role":"assistant", "model":"claude-haiku-5-5",
+        "content":content, "stop_reason":"end_turn", "usage":{"input_tokens":1,"output_tokens":1}
+    })
+    .to_string();
+    let events = [
+        serde_json::json!({"type":"message_start","message":{"id":"msg_opaque","type":"message","role":"assistant","content":[],"usage":{"input_tokens":1,"output_tokens":0}}}),
+        serde_json::json!({"type":"content_block_start","index":0,"content_block":{"type":"thinking","thinking":""}}),
+        serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":"","estimated_tokens":12}}),
+        serde_json::json!({"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":SIGNATURE}}),
+        serde_json::json!({"type":"content_block_stop","index":0}),
+        serde_json::json!({"type":"content_block_start","index":1,"content_block":content[1]}),
+        serde_json::json!({"type":"content_block_stop","index":1}),
+        serde_json::json!({"type":"content_block_start","index":2,"content_block":content[2]}),
+        serde_json::json!({"type":"content_block_stop","index":2}),
+        serde_json::json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":1}}),
+        serde_json::json!({"type":"message_stop"}),
+    ];
+    let sse: String = events
+        .iter()
+        .map(|event| format!("event: {}\ndata: {event}\n\n", event["type"].as_str().unwrap()))
+        .collect();
+    let captured = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let (seen, json_reply, stream_reply) = (captured.clone(), reply.clone(), sse.clone());
+    let router = axum::Router::new().fallback(move |body: String| {
+        let stream = rawjson::get(&body, "stream").bool();
+        seen.lock().unwrap().push(body);
+        let (content_type, reply) = if stream {
+            ("text/event-stream", stream_reply.clone())
+        } else {
+            ("application/json", json_reply.clone())
+        };
+        async move { ([(http::header::CONTENT_TYPE, content_type)], reply).into_response() }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    let executor = ClaudeExecutor::with_client(wreq::Client::new(), base);
+    let credential = harness_credential();
+    let cfg = safety_config("");
+    for stream in [false, true] {
+        let body = serde_json::json!({
+            "model":"claude-haiku-5-5", "stream":stream, "max_tokens":128,
+            "thinking":{"type":"adaptive","display":"omitted"},
+            "messages":[{"role":"user","content":"Question"}]
+        });
+        let response = executor
+            .execute(&credential, client_request(body.to_string(), Default::default()), &cfg)
+            .await
+            .unwrap();
+        let received = match response.body {
+            ResponseBody::Buffered(body) => body,
+            ResponseBody::Stream(events) => collect(events).await.unwrap(),
+        };
+        assert_eq!(
+            received.as_ref(),
+            if stream { sse.as_bytes() } else { reply.as_bytes() }
+        );
+        let replay = serde_json::json!({
+            "model":"claude-haiku-5-5", "stream":stream, "max_tokens":128,
+            "thinking":{"type":"disabled"},
+            "messages":[
+                {"role":"user","content":"Question"},
+                {"role":"assistant","content":content},
+                {"role":"user","content":"Continue"}
+            ]
+        });
+        drain(
+            &executor,
+            &credential,
+            &cfg,
+            client_request(replay.to_string(), Default::default()),
+        )
+        .await;
+        let captured = captured.lock().unwrap();
+        let sent = captured.last().unwrap();
+        assert_eq!(rawjson::get(sent, "messages.1.content").json(), content.to_string());
+        assert_eq!(rawjson::string(sent, "thinking.type"), "disabled");
+        assert!(!rawjson::get(sent, "thinking.block_binding").exists());
+    }
+}
+
+#[tokio::test]
+async fn selected_auth_kind_uses_normalized_metadata_and_attribute_modes() {
+    let cfg = safety_config("");
+    let req = safety_request(false);
+    for metadata in [false, true] {
+        for kind in ["apikey", " API_Key ", "api-key"] {
+            let mut credential = harness_credential();
+            if metadata {
+                credential.metadata.insert("auth_kind".into(), kind.into());
+            } else {
+                credential.attributes.insert("auth_kind".into(), kind.into());
+            }
+            credential
+                .metadata
+                .insert("access_token".into(), "opaque-api-key".into());
+            let prepared = safety_prepare(&credential, &cfg, &req).await;
+            assert_eq!(
+                sent_header(&prepared, "x-api-key"),
+                "opaque-api-key",
+                "{metadata}: {kind}"
+            );
+            assert!(sent_header(&prepared, "authorization").is_empty());
+
+            // A recognizable OAuth token still takes precedence over an API-key
+            // label, as in Go's claudeCredentialUsesOAuth.
+            credential
+                .metadata
+                .insert("access_token".into(), "sk-ant-oat-selected-token".into());
+            let prepared = safety_prepare(&credential, &cfg, &req).await;
+            assert_eq!(
+                sent_header(&prepared, "authorization"),
+                "Bearer sk-ant-oat-selected-token"
+            );
+            assert!(sent_header(&prepared, "x-api-key").is_empty());
+        }
+    }
+}

@@ -186,6 +186,92 @@ async fn expired_missing_identity_refreshes_before_profile_and_retains_rotation(
 }
 
 #[tokio::test]
+async fn forced_refresh_rotates_unexpired_token_before_missing_identity_preparation() {
+    let mock = Arc::new(Mock {
+        profile_status: 503,
+        ..Default::default()
+    });
+    let oauth = service(mock.clone()).await;
+    let executor =
+        crate::claude::ClaudeExecutor::with_client(wreq::Client::new(), "http://127.0.0.1").with_oauth(oauth);
+    let auth_dir = std::env::temp_dir().join(format!("claude-forced-{}", uuid::Uuid::new_v4()));
+    let cfg = cpa_core::config::Config::parse(&format!(
+        "config-version: 8\noauth:\n  auth-dir: {}\n",
+        serde_json::to_string(&auth_dir.to_string_lossy()).unwrap()
+    ))
+    .unwrap();
+    let mut credential = credential();
+    credential.metadata.remove("account_uuid");
+    credential
+        .metadata
+        .insert("expired".into(), "2099-01-01T00:00:00Z".into());
+    assert!(needs_identity(&credential));
+    assert!(!refresh_due(&credential, Utc::now()));
+    let patch = executor.prepare_forced(&credential, &cfg).await.unwrap();
+    assert_eq!(patch.set["access_token"], "sk-ant-oat-new-fake");
+    assert_eq!(patch.set["refresh_token"], "fake-rotated");
+    assert!(!patch.set.contains_key("claude_device_ids"));
+    patch.apply(&mut credential.metadata);
+    assert!(
+        needs_identity(&credential),
+        "identity can be prepared after the rotation commits"
+    );
+    let calls = mock.calls.lock().unwrap();
+    assert_eq!(
+        calls.iter().map(|call| call.0.as_str()).collect::<Vec<_>>(),
+        ["/token", "/profile"]
+    );
+    assert_eq!(calls[1].1["authorization"], "Bearer sk-ant-oat-new-fake");
+}
+
+#[tokio::test]
+async fn identity_preparation_uses_the_selected_token_without_rotating_stored_tokens() {
+    let mock = Arc::new(Mock::default());
+    let oauth = service(mock.clone()).await;
+    let mut credential = credential();
+    credential.metadata.remove("account_uuid");
+    credential
+        .metadata
+        .insert("expired".into(), "2099-01-01T00:00:00Z".into());
+    credential
+        .metadata
+        .insert("access_token".into(), "unused-metadata-token".into());
+    credential
+        .attributes
+        .insert("api_key".into(), "sk-ant-oat-attribute-fake".into());
+    assert!(needs_identity(&credential));
+    let before = credential.metadata.clone();
+    let patch = oauth.prepare(&credential, &Proxy::Inherit).await.unwrap();
+    assert_eq!(patch.set["account_uuid"], "profile-account");
+    assert!(!patch.set.contains_key("access_token"));
+    assert!(!patch.set.contains_key("refresh_token"));
+    assert_eq!(credential.metadata, before);
+    {
+        let calls = mock.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "/profile");
+        assert_eq!(calls[0].1["authorization"], "Bearer sk-ant-oat-attribute-fake");
+    }
+
+    // A non-OAuth API key wins over leftover OAuth metadata too. With no grant,
+    // ordinary preparation must not profile or modify that shadowed token.
+    credential
+        .attributes
+        .insert("api_key".into(), "ordinary-api-key".into());
+    credential
+        .metadata
+        .insert("access_token".into(), "sk-ant-oat-shadowed-fake".into());
+    credential.metadata.remove("refresh_token");
+    assert!(!needs_identity(&credential));
+    assert!(!needs_prepare(&credential, Utc::now()));
+    let before = credential.metadata.clone();
+    let patch = oauth.prepare(&credential, &Proxy::Inherit).await.unwrap();
+    assert!(patch.set.is_empty() && patch.remove.is_empty());
+    assert_eq!(credential.metadata, before);
+    assert_eq!(mock.calls.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn missing_rotated_refresh_and_profile_fields_keep_saved_values() {
     let mock = Arc::new(Mock {
         omit_refresh: true,
@@ -574,6 +660,7 @@ async fn home_device_pools_match_go() {
             attributes,
             metadata: scenario["metadata"].as_object().cloned().unwrap_or_default(),
             revision: 0,
+            parsed_by_plugin: false,
             next_refresh_after: None,
         };
         let raw_pool = credential.metadata.get("claude_device_ids");

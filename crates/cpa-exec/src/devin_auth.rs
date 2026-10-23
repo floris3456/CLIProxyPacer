@@ -638,12 +638,13 @@ pub(crate) fn save_metadata_file(
     provider: &str,
 ) -> Result<PathBuf, String> {
     let path = auth_dir.join(file_name);
+    let file = crate::codex_siwc_bind::CredentialFileLease::acquire_for_write(&path)?;
     let mut metadata: GoMap = metadata
         .iter()
         .map(|(k, v)| (k.clone(), GoValue::from_json(v)))
         .collect();
     let mut disabled = false;
-    let existing = std::fs::read(&path).ok();
+    let existing = std::fs::read(file.path()).ok();
     if let Some(raw) = existing.as_deref().filter(|r| !r.is_empty())
         && let Some((map, true)) = go_map_from_json(raw)
         && !map.is_empty()
@@ -666,7 +667,8 @@ pub(crate) fn save_metadata_file(
     {
         return Ok(path);
     }
-    crate::kimi_auth::write_private(&path, &raw).map_err(|e| format!("auth filestore: write file failed: {e}"))?;
+    crate::kimi_auth::write_private(file.path(), &raw)
+        .map_err(|e| format!("auth filestore: write file failed: {e}"))?;
     Ok(path)
 }
 

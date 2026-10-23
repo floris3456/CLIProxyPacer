@@ -381,7 +381,9 @@ impl OAuth {
 
     async fn prepare_inner(&self, credential: &Credential) -> Result<MetadataPatch, ExecError> {
         let mut patch = MetadataPatch::default();
-        let access = credential.str("access_token").unwrap_or_default().to_owned();
+        // Identity must follow the inference token, including an OAuth token in
+        // the API-key attribute and an ordinary key shadowing stored OAuth data.
+        let access = crate::claude::ClaudeView::new(credential).map_or("", |view| view.access_token);
         if access.contains("sk-ant-oat") {
             if !canonical_pool(credential.metadata.get("claude_device_ids")) {
                 let device = ensure_device_pool(credential).await?;
@@ -394,7 +396,7 @@ impl OAuth {
                 let profile = if setup {
                     None
                 } else {
-                    match tokio::time::timeout(Duration::from_secs(10), self.profile(&access)).await {
+                    match tokio::time::timeout(Duration::from_secs(10), self.profile(access)).await {
                         Ok(Ok(profile)) => Some(profile),
                         Ok(Err(error)) if error.status == 403 => None,
                         Ok(Err(error)) => return Err(error),
@@ -440,7 +442,7 @@ pub(crate) fn needs_prepare(credential: &Credential, now: DateTime<Utc>) -> bool
 /// Go `ClaudeExecutor.ShouldPrepareRequestAuth`: an OAuth token without a canonical
 /// device pool or account UUID cannot be cloaked, so requests wait for preparation.
 pub(crate) fn needs_identity(credential: &Credential) -> bool {
-    credential.str("access_token").is_some_and(|s| s.contains("sk-ant-oat"))
+    crate::claude::ClaudeView::new(credential).is_ok_and(|view| view.access_token.contains("sk-ant-oat"))
         && (!canonical_pool(credential.metadata.get("claude_device_ids"))
             || credential.str("account_uuid").unwrap_or_default().trim().is_empty())
 }

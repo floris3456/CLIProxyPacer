@@ -855,9 +855,10 @@ pub fn save_login(auth_dir: &Path, bundle: &Bundle, now: DateTime<Utc>) -> Resul
     };
     let mut metadata = login_metadata(&storage, bundle);
     let path = auth_dir.join(&file_name);
+    let file = crate::codex_siwc_bind::CredentialFileLease::acquire_for_write(&path)?;
     let mut disabled = false;
     // Manager.Login merges only a cleanly decoded, non-empty existing file.
-    if let Ok(raw) = std::fs::read(&path)
+    if let Ok(raw) = std::fs::read(file.path())
         && let Some((existing, true)) = go_map_from_json(&raw)
         && !existing.is_empty()
         && let Some(flag) = merge_existing(&mut metadata, &existing, "meta")
@@ -871,7 +872,7 @@ pub fn save_login(auth_dir: &Path, bundle: &Bundle, now: DateTime<Utc>) -> Resul
             .map_err(|e| format!("auth filestore: invalid metadata weight: {e}"))?;
     }
     metadata.insert("disabled".into(), GoValue::Bool(disabled));
-    save_token_file(&path, &storage, Some(&metadata)).map_err(|e| format!("meta token storage: {e}"))?;
+    save_token_file(file.path(), &storage, Some(&metadata)).map_err(|e| format!("meta token storage: {e}"))?;
     Ok(LoginOutcome { path, label })
 }
 

@@ -42,7 +42,7 @@ use crate::devin_wire::{
 use crate::gemini_stream::ClaudeInputTokens;
 use crate::kimi_http::{capture_chunk, capture_error, capture_metadata, capture_request};
 use crate::openai_compat_payload::ensure_responses_usage_details;
-use crate::proxy::{GoClients, GoHeaders, Proxy, default_client, read_all, send};
+use crate::proxy::{GoClients, GoHeaders, Proxy, default_client, read_all, request_once};
 
 /// Provider string served by this executor.
 pub const PROVIDER: &str = "devin";
@@ -520,9 +520,27 @@ impl DevinExecutor {
             ("devin", &prepared.auth_value),
         );
         req.usage.round_trip_started();
-        let mut upstream = send(&client, &prepared.url, prepared.headers, prepared.body, None)
-            .await
-            .inspect_err(|e| capture_error(&capture, e))?;
+        // The protobuf embeds the session token as well as authenticating by header.
+        // Stripping redirect headers cannot protect a replayed 307/308 request body.
+        let mut upstream = request_once(
+            &client,
+            wreq::Method::POST,
+            &prepared.url,
+            prepared.headers,
+            Some(prepared.body),
+            None,
+        )
+        .await
+        .inspect_err(|e| capture_error(&capture, e))?;
+        if (300..400).contains(&upstream.status) {
+            let error = ExecError::local(
+                502,
+                FailureScope::Transport,
+                "devin inference endpoint redirects are not allowed",
+            );
+            capture_error(&capture, &error);
+            return Err(error);
+        }
         capture_metadata(&capture, upstream.status, &upstream.headers);
         upstream.body = crate::kimi_http::track_first_byte(upstream.body, &req.usage, false);
         if !(200..300).contains(&upstream.status) {

@@ -126,55 +126,153 @@ pub fn device_id(path: &Path) -> Result<String, String> {
 /// of the decoded map (sorted keys, numbers through float64), written atomically.
 /// Blocking.
 pub fn save(path: &Path, tokens: &Tokens) -> Result<(), String> {
-    with_file_lock(path, || {
-        let data = std::fs::read(path).map_err(|e| format!("failed to read existing credential file: {e}"))?;
-        let meta = decode(&data).map_err(|e| format!("failed to parse existing credential file: {e}"))?;
-        validate(meta.as_ref())?;
-        let mut meta = meta.unwrap_or_default();
-        // Binding is an explicit SIWC replacement, not a stale snapshot merge.
-        meta.insert("use_siwc".into(), GoValue::Bool(true));
-        meta.insert(
-            "siwc".into(),
-            GoValue::from_json(&serde_json::Value::Object(tokens.to_map())),
-        );
-        let bytes = GoValue::Object(meta).marshal();
-        let dir = path.parent().unwrap_or(Path::new("."));
-        crate::codex_oauth::publish(dir, path, &bytes).map_err(|e| format!("failed to replace credential file: {e}"))
-    })
+    let file = CredentialFileLease::acquire_blocking(path)?;
+    let path = file.path();
+    let data = std::fs::read(path).map_err(|e| format!("failed to read existing credential file: {e}"))?;
+    let meta = decode(&data).map_err(|e| format!("failed to parse existing credential file: {e}"))?;
+    validate(meta.as_ref())?;
+    let mut meta = meta.unwrap_or_default();
+    // Binding is an explicit SIWC replacement, not a stale snapshot merge.
+    meta.insert("use_siwc".into(), GoValue::Bool(true));
+    meta.insert(
+        "siwc".into(),
+        GoValue::from_json(&serde_json::Value::Object(tokens.to_map())),
+    );
+    let bytes = GoValue::Object(meta).marshal();
+    let dir = path.parent().unwrap_or(Path::new("."));
+    crate::codex_oauth::publish(dir, path, &bytes).map_err(|e| format!("failed to replace credential file: {e}"))
 }
 
 /// Go `WithFileLock`'s inter-process half: an exclusive lock on `<path>.lock` for the
 /// duration of `f` (`flock`, or `LockFileEx` on Windows), so a Go or Rust process
 /// refreshing the same file waits.
-// ponytail: Go also serializes callers in one process with a mutex per path; the CLI is
-// the only caller here, and the server's refresh writer does not take this lock yet.
+/// Blocking; asynchronous refreshes use [`CredentialFileLease::acquire`] instead.
 pub fn with_file_lock<T>(path: &Path, f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
-    let mut lock_path = lock_base(path).into_os_string();
-    lock_path.push(".lock");
-    let lock_path = PathBuf::from(lock_path);
-    let mut options = std::fs::OpenOptions::new();
-    options.read(true).write(true).create(true).truncate(false);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-    let file = options
-        .open(&lock_path)
-        .map_err(|e| format!("failed to open credential lock file {}: {e}", lock_path.display()))?;
-    lock_exclusive(&file).map_err(|e| format!("failed to acquire flock on {}: {e}", lock_path.display()))?;
+    let lease = CredentialFileLease::acquire_blocking(path)?;
     // Closing the file releases the lock.
     let result = f();
-    drop(file);
+    drop(lease);
     result
 }
 
+/// An owned, Go-compatible lock on one credential file. Hold it through rereading the
+/// file, refreshing its tokens, and atomically persisting the result. Dropping it closes
+/// the lock handle; the `.lock` file stays in place so waiters keep using the same inode.
+///
+/// This coordinates writers that use the same lock file. Copies of a credential, remote
+/// stores with independent local caches, and writers that ignore the lock are outside
+/// this contract. The owner must keep an in-flight refresh and its persistence together
+/// if its caller is cancelled; acquiring a lease alone cannot make that transaction safe.
+#[must_use = "hold the credential lease through refresh and persistence"]
+pub struct CredentialFileLease {
+    path: PathBuf,
+    lock_path: PathBuf,
+    file: std::fs::File,
+}
+
+impl CredentialFileLease {
+    fn open(path: &Path) -> Result<Self, String> {
+        let base = lock_base(path).map_err(|e| format!("failed to resolve credential lock path: {e}"))?;
+        // Go trims only the lock's name, not the filename used for credential I/O.
+        // `c.json` and `c.json ` share a lock but can be distinct credentials on Unix.
+        let path = if path.to_str().is_some_and(|s| s != s.trim()) {
+            canonical_path(path).map_err(|e| format!("failed to resolve credential file: {e}"))?
+        } else {
+            base.clone()
+        };
+        let mut lock_path = base.into_os_string();
+        lock_path.push(".lock");
+        let lock_path = PathBuf::from(lock_path);
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let file = options
+            .open(&lock_path)
+            .map_err(|e| format!("failed to open credential lock file {}: {e}", lock_path.display()))?;
+        Ok(Self { path, lock_path, file })
+    }
+
+    /// Acquires the same lease for a blocking file writer. Take this before holding
+    /// in-memory store locks, and do not reacquire it while already holding a lease.
+    pub fn acquire_blocking(path: &Path) -> Result<Self, String> {
+        let lease = Self::open(path)?;
+        lease.lock(true)?;
+        Ok(lease)
+    }
+
+    /// A blocking login writer may create its private credential directory first.
+    /// Refresh readers use the other constructors so a missing directory is an error.
+    pub fn acquire_for_write(path: &Path) -> Result<Self, String> {
+        let parent = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."));
+        let mut directory = std::fs::DirBuilder::new();
+        directory.recursive(true);
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut directory, 0o700);
+        directory
+            .create(parent)
+            .map_err(|e| format!("failed to create credential directory: {e}"))?;
+        Self::acquire_blocking(path)
+    }
+
+    /// Attempts the lock once for a best-effort synchronous writer. `None` means
+    /// another writer holds it; filesystem lookup/open still run synchronously.
+    pub fn try_acquire(path: &Path) -> Result<Option<Self>, String> {
+        let lease = Self::open(path)?;
+        if lease.lock(false)? { Ok(Some(lease)) } else { Ok(None) }
+    }
+
+    /// Waits without blocking an executor thread in `flock` or `LockFileEx`. Cancelling
+    /// a waiter drops its handle; it cannot later acquire a lock in an abandoned blocking
+    /// job. Only the filesystem lookup and open run on the blocking pool.
+    pub async fn acquire(path: &Path) -> Result<Self, String> {
+        let path = path.to_owned();
+        let lease = tokio::task::spawn_blocking(move || Self::open(&path))
+            .await
+            .map_err(|_| "credential lock task failed".to_owned())??;
+        while !lease.lock(false)? {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        Ok(lease)
+    }
+
+    /// The canonical credential target, preserving literal filename whitespace. Use
+    /// this for an atomic write through a symlink alias so the alias is not replaced.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Checks that a queued writer still names this data target, including symlink
+    /// aliases and Windows verbatim paths. A missing final file resolves against its
+    /// parent; unreadable paths fail instead of silently accepting a different target.
+    pub fn matches_path(&self, path: &Path) -> Result<bool, String> {
+        canonical_path(path)
+            .map(|target| target == self.path)
+            .map_err(|e| format!("failed to resolve credential file: {e}"))
+    }
+
+    fn lock(&self, blocking: bool) -> Result<bool, String> {
+        lock_exclusive(&self.file, blocking)
+            .map_err(|e| format!("failed to acquire flock on {}: {e}", self.lock_path.display()))
+    }
+}
+
 #[cfg(unix)]
-fn lock_exclusive(file: &std::fs::File) -> std::io::Result<()> {
+fn lock_exclusive(file: &std::fs::File, blocking: bool) -> std::io::Result<bool> {
     use std::os::fd::AsRawFd;
+    let flags = libc::LOCK_EX | if blocking { 0 } else { libc::LOCK_NB };
     loop {
         // SAFETY: a valid open descriptor; flock touches no memory.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
-            return Ok(());
+        if unsafe { libc::flock(file.as_raw_fd(), flags) } == 0 {
+            return Ok(true);
         }
         let error = std::io::Error::last_os_error();
+        if !blocking && error.kind() == std::io::ErrorKind::WouldBlock {
+            return Ok(false);
+        }
         if error.kind() != std::io::ErrorKind::Interrupted {
             return Err(error);
         }
@@ -182,32 +280,35 @@ fn lock_exclusive(file: &std::fs::File) -> std::io::Result<()> {
 }
 
 #[cfg(windows)]
-fn lock_exclusive(file: &std::fs::File) -> std::io::Result<()> {
+fn lock_exclusive(file: &std::fs::File, blocking: bool) -> std::io::Result<bool> {
     use std::os::windows::io::AsRawHandle;
-    use windows_sys::Win32::Storage::FileSystem::{LOCKFILE_EXCLUSIVE_LOCK, LockFileEx};
+    use windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION;
+    use windows_sys::Win32::Storage::FileSystem::{LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx};
+    let flags = LOCKFILE_EXCLUSIVE_LOCK | if blocking { 0 } else { LOCKFILE_FAIL_IMMEDIATELY };
     // Go locks the first byte; overlapping ranges conflict, so the two interoperate.
     // SAFETY: a valid open handle and a zeroed OVERLAPPED that outlives the call.
     let ok = unsafe {
         let mut overlapped: windows_sys::Win32::System::IO::OVERLAPPED = std::mem::zeroed();
-        LockFileEx(
-            file.as_raw_handle() as _,
-            LOCKFILE_EXCLUSIVE_LOCK,
-            0,
-            1,
-            0,
-            &mut overlapped,
-        )
+        LockFileEx(file.as_raw_handle() as _, flags, 0, 1, 0, &mut overlapped)
     };
     if ok == 0 {
-        Err(std::io::Error::last_os_error())
+        let error = std::io::Error::last_os_error();
+        if !blocking && error.raw_os_error() == Some(ERROR_LOCK_VIOLATION as i32) {
+            Ok(false)
+        } else {
+            Err(error)
+        }
     } else {
-        Ok(())
+        Ok(true)
     }
 }
 
 #[cfg(not(any(unix, windows)))]
-fn lock_exclusive(_: &std::fs::File) -> std::io::Result<()> {
-    Ok(())
+fn lock_exclusive(_: &std::fs::File, _: bool) -> std::io::Result<bool> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "credential file locking is unsupported on this platform",
+    ))
 }
 
 /// Go `filepath.Clean`, lexically.
@@ -265,12 +366,27 @@ fn go_abs(path: &Path) -> std::io::Result<PathBuf> {
     std::path::absolute(go_clean(path)).map(|p| go_clean(&p))
 }
 
-/// Go `canonicalLockPath`: the path trimmed of surrounding white space, cleaned and made
-/// absolute. The lock file is this plus `.lock`, so a file named with trailing spaces
-/// shares its lock with Go's.
-fn lock_base(path: &Path) -> PathBuf {
+/// Go `canonicalLockPath`: trim, clean, make absolute and resolve symlinks. If the
+/// credential does not exist yet, resolve its parent. The lock file is this plus
+/// `.lock`, including Go's trimming of a filename's surrounding whitespace.
+fn lock_base(path: &Path) -> std::io::Result<PathBuf> {
     let trimmed = path.to_str().map_or(path, |s| Path::new(s.trim()));
-    go_abs(trimmed).unwrap_or_else(|_| go_clean(trimmed))
+    canonical_path(trimmed)
+}
+
+fn canonical_path(path: &Path) -> std::io::Result<PathBuf> {
+    let cleaned = go_abs(path)?;
+    match std::fs::canonicalize(&cleaned) {
+        Ok(real) => Ok(go_clean(&plain_path(real))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let (Some(parent), Some(name)) = (cleaned.parent(), cleaned.file_name()) else {
+                return Err(error);
+            };
+            let real = std::fs::canonicalize(parent)?;
+            Ok(go_clean(&plain_path(real).join(name)))
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// `-siwc-bind <file>`: the browser flow on the callback port (`-oauth-callback-port`,

@@ -468,6 +468,7 @@ impl Draft {
             attributes: self.attrs,
             metadata: self.meta,
             revision: 0,
+            parsed_by_plugin: false,
             next_refresh_after: None,
         }
     }
@@ -981,7 +982,7 @@ fn raw_models(v: Option<&Value>) -> Vec<Json> {
 
 /// Go `NormalizeCredentialMetadata`: config-style aliases become snake_case unless the
 /// canonical key is present.
-fn normalize_metadata(meta: &mut Map<String, Json>) {
+pub fn normalize_metadata(meta: &mut Map<String, Json>) {
     for (alias, canonical) in [
         ("api-key", "api_key"),
         ("base-url", "base_url"),
@@ -1091,12 +1092,48 @@ fn file_credentials(
     if provider.is_empty() || provider == "gemini" || provider == "gemini-cli" {
         return Ok(None);
     }
+    let (mut attrs, invalid) = file_attributes(&provider, &meta, weight);
+    // Invalid rules must not drop the credential: keep the valid entries and warn
+    // (Go 1a28c61e). Global exclusions apply at registration (Go b015f208).
+    if let Some(error) = invalid {
+        let file = path.file_name().unwrap_or_default().to_string_lossy();
+        tracing::warn!(%error, "ignoring invalid excluded models in auth file {file}");
+    }
     let full = path.display().to_string();
-    let mut attrs = BTreeMap::new();
     for key in ["source", "path"] {
         attrs.insert(key.into(), full.clone());
     }
     attrs.insert("source_backend".into(), "file".into());
+    attrs.insert("auth_kind".into(), "oauth".into());
+    let id = path
+        .strip_prefix(auth_dir)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .into_owned();
+    let mut cred = Credential {
+        id,
+        provider,
+        source: Source::File(path.to_owned()),
+        disabled: false,
+        label: String::new(),
+        attributes: attrs,
+        metadata: meta,
+        revision: 0,
+        parsed_by_plugin: false,
+        next_refresh_after: None,
+    };
+    cred.refresh_derived();
+    Ok(Some(FileCredentials::One(Box::new(cred))))
+}
+
+/// Attributes copied from a native file's normalized metadata. Keep this projection
+/// shared by initial synthesis and adoption of another process's refreshed file.
+fn file_attributes(
+    provider: &str,
+    meta: &Map<String, Json>,
+    weight: Option<i64>,
+) -> (BTreeMap<String, String>, Option<String>) {
+    let mut attrs = BTreeMap::new();
     match meta.get("priority") {
         Some(Json::Number(n)) => {
             let p = n.as_f64().map(|f| f.trunc() as i64).unwrap_or(0);
@@ -1130,19 +1167,11 @@ fn file_credentials(
     if let Some(aliases) = oauth_aliases(meta.get("model_aliases")) {
         attrs.insert("model_aliases".into(), aliases);
     }
-    // Invalid rules must not drop the credential: keep the valid entries and warn (Go
-    // 1a28c61e). Only the credential's own rules are stored; the global
-    // `oauth-excluded-models` apply at registration when there are none (Go b015f208).
-    let (per_account, invalid) = excluded_models_from_metadata(&meta);
-    if let Some(error) = invalid {
-        let file = path.file_name().unwrap_or_default().to_string_lossy();
-        tracing::warn!(%error, "ignoring invalid excluded models in auth file {file}");
-    }
+    let (per_account, invalid) = excluded_models_from_metadata(meta);
     let combined = excluded_union(&[&per_account]);
     if !combined.is_empty() {
         attrs.insert("excluded_models".into(), combined.join(","));
     }
-    attrs.insert("auth_kind".into(), "oauth".into());
     if let Some(p) = meta
         .get("fingerprint_profile")
         .and_then(Json::as_str)
@@ -1151,8 +1180,8 @@ fn file_credentials(
     {
         attrs.insert("fingerprint_profile".into(), p);
     }
-    if matches!(provider.as_str(), "kimi" | "kimi-ai" | "kimi.ai" | "kimi.com") {
-        kimi_attributes(&provider, &meta, &mut attrs);
+    if matches!(provider, "kimi" | "kimi-ai" | "kimi.ai" | "kimi.com") {
+        kimi_attributes(provider, meta, &mut attrs);
     }
     if provider == "codex" {
         let plan = meta
@@ -1178,24 +1207,67 @@ fn file_credentials(
     {
         attrs.insert("proxy_url".into(), proxy.into());
     }
-    let id = path
-        .strip_prefix(auth_dir)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .into_owned();
-    let mut cred = Credential {
-        id,
-        provider,
-        source: Source::File(path.to_owned()),
-        disabled: false,
-        label: String::new(),
-        attributes: attrs,
-        metadata: meta,
-        revision: 0,
-        next_refresh_after: None,
+    (attrs, invalid)
+}
+
+/// Reconciles file-derived attributes after adopting changed metadata. Attributes
+/// that differ from the old file's projection are execution overrides and survive;
+/// an absent attribute may take a newly supplied file value. Header overrides are
+/// compared case-insensitively so a case change cannot supersede one on the wire.
+/// Source/path, authentication kind and other non-derived attributes are untouched.
+pub fn refresh_file_attributes(before: &Credential, next: &mut Credential) -> Result<(), String> {
+    if !matches!(before.source, Source::File(_))
+        || before.parsed_by_plugin
+        || before.attributes.get("plugin_virtual").is_some_and(|v| v == "true")
+    {
+        return Ok(());
+    }
+    let project = |credential: &Credential| {
+        let weight = credential
+            .metadata
+            .get("weight")
+            .map(parse_weight)
+            .transpose()
+            .map_err(|e| format!("invalid metadata weight: {e}"))?;
+        Ok::<_, String>(file_attributes(&credential.provider, &credential.metadata, weight).0)
     };
-    cred.refresh_derived();
-    Ok(Some(FileCredentials::One(Box::new(cred))))
+    let (old, new) = (project(before)?, project(next)?);
+    let header_name = |key: &str| key.strip_prefix("header:").map(|name| name.trim().to_ascii_lowercase());
+    let mut changed_headers = HashSet::new();
+    for key in old.keys().chain(new.keys()) {
+        if old.get(key) == new.get(key) {
+            continue;
+        }
+        if let Some(name) = header_name(key) {
+            changed_headers.insert(name);
+        } else if next.attributes.get(key).is_none_or(|value| old.get(key) == Some(value)) {
+            match new.get(key) {
+                Some(value) => {
+                    next.attributes.insert(key.clone(), value.clone());
+                }
+                None => {
+                    next.attributes.remove(key);
+                }
+            }
+        }
+    }
+    let mut overrides = HashSet::new();
+    next.attributes.retain(|key, value| {
+        let Some(name) = header_name(key).filter(|name| changed_headers.contains(name)) else {
+            return true;
+        };
+        if old.get(key).map(String::as_str) == Some(value.as_str()) {
+            return false;
+        }
+        overrides.insert(name);
+        true
+    });
+    for (key, value) in new {
+        if header_name(&key).is_some_and(|name| changed_headers.contains(&name) && !overrides.contains(&name)) {
+            next.attributes.insert(key, value);
+        }
+    }
+    Ok(())
 }
 
 /// Go `buildAuthFromFileData`'s fallback for an uploaded file no synthesizer claims:
@@ -1237,6 +1309,7 @@ pub fn upload_fallback(auth_dir: &Path, path: &Path, data: &[u8]) -> Option<Cred
         attributes,
         metadata: meta,
         revision: 0,
+        parsed_by_plugin: false,
         next_refresh_after: None,
     })
 }

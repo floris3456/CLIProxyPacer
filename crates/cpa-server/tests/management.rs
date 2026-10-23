@@ -4135,8 +4135,7 @@ async fn siwc_binding_flows_follow_go() {
     // A successful binding clears the target's unauthorized cooldowns and keeps its
     // quota blocks (Go `BindCodexSIWC`), and leaves other credentials alone. Recording
     // a result rewrites the file the way Go's `MarkResult` persist does.
-    let fail = |id: &str, model: &str, status: u16, scope| {
-        use cpa_core::exec::ExecError;
+    let take = |id: &str, model: &str| {
         let mut selection = cpa_server::runtime::Selection::new("codex", model);
         selection.exclude = ["codex.json", "no-refresh.json"]
             .into_iter()
@@ -4145,15 +4144,27 @@ async fn siwc_binding_flows_follow_go() {
             .collect();
         let lease = f.rt.store().select(selection).unwrap();
         assert_eq!(lease.credential.id, id);
+        lease
+    };
+    use cpa_core::exec::{ExecError, FailureScope};
+    // These requests were already in flight when the first 401 rejected the token.
+    // A new request after that result must not acquire the same rejected token.
+    let attempts = [
+        (take("codex.json", "m-unauthorized"), 401, FailureScope::Credential),
+        (take("codex.json", "m-quota"), 429, FailureScope::Model),
+        (take("codex.json", "m-forbidden"), 403, FailureScope::Credential),
+        (take("no-refresh.json", "m-unauthorized"), 401, FailureScope::Credential),
+    ];
+    for (lease, status, scope) in attempts {
         let mut error = ExecError::local(status, scope, "upstream said no");
         error.retry_after = Some(Duration::from_secs(600));
         lease.complete(cpa_server::runtime::Outcome::Failure(error));
-    };
-    use cpa_core::exec::FailureScope;
-    fail("codex.json", "m-unauthorized", 401, FailureScope::Credential);
-    fail("codex.json", "m-quota", 429, FailureScope::Model);
-    fail("codex.json", "m-forbidden", 403, FailureScope::Credential);
-    fail("no-refresh.json", "m-unauthorized", 401, FailureScope::Credential);
+    }
+    assert!(
+        f.rt.store()
+            .select(cpa_server::runtime::Selection::new("codex", "m-new"))
+            .is_none()
+    );
     let cooling = |id: &str| {
         f.rt.store()
             .cooldowns(id)

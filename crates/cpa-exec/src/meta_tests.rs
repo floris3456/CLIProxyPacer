@@ -76,6 +76,7 @@ fn meta_credential(fx: &Value, origin: &str, url: &str) -> Credential {
         attributes: Default::default(),
         metadata,
         revision: 0,
+        parsed_by_plugin: false,
         next_refresh_after: None,
     };
     c.refresh_derived();

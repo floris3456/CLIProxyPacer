@@ -927,6 +927,7 @@ mod tests {
             attributes: Default::default(),
             metadata: metadata.as_object().cloned().unwrap_or_default(),
             revision: 0,
+            parsed_by_plugin: false,
             next_refresh_after: None,
         };
         c.attributes

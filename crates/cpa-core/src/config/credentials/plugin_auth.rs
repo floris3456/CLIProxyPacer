@@ -495,6 +495,7 @@ fn into_credential(mut auth: ParsedAuth, path: &Path) -> Credential {
         label: auth.label,
         attributes: auth.attributes,
         metadata: auth.metadata,
+        parsed_by_plugin: true,
         revision: 0,
         next_refresh_after: auth.next_refresh_after,
     }
@@ -667,6 +668,7 @@ mod tests {
             r#"{"type":"acme","prefix":"/team/","proxy_url":" socks5://p "}"#,
         );
         assert_eq!(auths.len(), 1);
+        assert!(auths[0].parsed_by_plugin);
         let attrs = &auths[0].attributes;
         assert!(!attrs.contains_key("plugin_virtual") && !attrs.contains_key("auth_index_seed"));
         assert_eq!(attrs["prefix"], "team");
@@ -803,7 +805,10 @@ mod tests {
             let plain = file_credentials(None, Path::new(DIR), &path, raw.as_bytes());
             let asked = synth(&parser, "a.json", raw);
             let show = |r: Result<Option<FileCredentials>, String>| match r {
-                Ok(Some(FileCredentials::One(c))) => format!("{c:?}"),
+                Ok(Some(FileCredentials::One(c))) => {
+                    assert!(!c.parsed_by_plugin);
+                    format!("{c:?}")
+                }
                 Ok(Some(FileCredentials::Plugin(all))) => format!("plugin {all:?}"),
                 Ok(Some(FileCredentials::Deferred)) => "deferred".into(),
                 Ok(Some(FileCredentials::Unapplied(all))) => format!("unapplied {all:?}"),

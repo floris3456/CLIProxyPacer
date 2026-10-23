@@ -657,11 +657,48 @@ fn go_encode(value: &Value, out: &mut Vec<u8>) {
 pub(crate) fn write_login(directory: &Path, patch: MetadataPatch) -> Result<PathBuf, ExecError> {
     let (path, legacy) = write_canonical(directory, patch)?;
     if let Some(legacy) = legacy {
-        std::fs::remove_file(&legacy).map_err(|_| {
+        remove_legacy_if_matching(&path, &legacy, |path| match std::fs::remove_file(path) {
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => Err(error.to_string()),
+            _ => Ok(()),
+        })
+        .map_err(|_| {
             login_error("cliproxy auth: canonical Claude credential saved but legacy credential cleanup failed")
         })?;
     }
     Ok(path)
+}
+
+/// Rechecks a legacy migration after waiting for that file's writer. The canonical
+/// save must have released its lease first. `remove` supports the management token
+/// store's deletion while the same legacy lease remains held.
+pub fn remove_legacy_if_matching(
+    canonical: &Path,
+    legacy: &Path,
+    remove: impl FnOnce(&Path) -> Result<(), String>,
+) -> Result<(), String> {
+    if !legacy.try_exists().map_err(|e| e.to_string())? {
+        return Ok(());
+    }
+    let file = crate::codex_siwc_bind::CredentialFileLease::acquire_blocking(legacy)?;
+    if !file.matches_path(legacy)? {
+        return Ok(());
+    }
+    let Some(target) = read_json(canonical).filter(|m| {
+        m.get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|t| t.trim().go_eq_fold("claude"))
+    }) else {
+        return Ok(());
+    };
+    let target = target.into_iter().collect();
+    let Some(name) = canonical.file_name().and_then(|n| n.to_str()) else {
+        return Ok(());
+    };
+    let directory = legacy.parent().unwrap_or(Path::new("."));
+    if legacy_credential(directory, name, &target).as_deref() != Some(legacy) {
+        return Ok(());
+    }
+    remove(legacy)
 }
 
 /// [`write_login`] without the legacy removal: the canonical path and the legacy file
@@ -685,11 +722,13 @@ fn write_canonical(directory: &Path, patch: MetadataPatch) -> Result<(PathBuf, O
     }
     let name = credential_file_name(&email, &string("organization_uuid"), &string("account_uuid"));
     let path = directory.join(&name);
+    let file = crate::codex_siwc_bind::CredentialFileLease::acquire_for_write(&path)
+        .map_err(|_| login_error("cannot lock Claude credential"))?;
     let mut metadata: BTreeMap<String, Value> = patch.set.clone().into_iter().collect();
     for key in &patch.remove {
         metadata.remove(key);
     }
-    if let Some(existing) = read_json(&path) {
+    if let Some(existing) = read_json(file.path()) {
         merge_existing(&mut metadata, &existing);
     }
     let legacy = legacy_credential(directory, &name, &metadata);
@@ -699,7 +738,8 @@ fn write_canonical(directory: &Path, patch: MetadataPatch) -> Result<(PathBuf, O
     let mut bytes = Vec::new();
     go_encode(&Value::Object(metadata.into_iter().collect()), &mut bytes);
     bytes.push(b'\n');
-    publish(directory, &path, &bytes).map_err(|_| login_error("cannot publish Claude credential"))?;
+    publish(file.path().parent().unwrap_or(directory), file.path(), &bytes)
+        .map_err(|_| login_error("cannot publish Claude credential"))?;
     let legacy = legacy.filter(|l| *l != path);
     Ok((path, legacy))
 }

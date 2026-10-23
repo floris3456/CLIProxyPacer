@@ -334,6 +334,18 @@ pub(crate) fn build(p: &Plan<'_>) -> GoHeader {
         if model.contains("haiku") && !rawjson::get(p.body, "fallbacks").exists() && !p.helper {
             b = betas::without(&b, betas::SERVER_SIDE_FALLBACK);
         }
+        // Binding controls need their beta in caller-owned and native profiles too.
+        // Explicit header controls still run last and may strip it.
+        if rawjson::get(p.body, "thinking.block_binding").exists()
+            && !b.split(',').any(|beta| beta.trim() == betas::THINKING_BINDING)
+        {
+            if b.trim().is_empty() {
+                b.clear();
+            } else {
+                b.push(',');
+            }
+            b.push_str(betas::THINKING_BINDING);
+        }
         b
     };
     let apply_betas = |h: &mut GoHeader, b: &str| {

@@ -54,17 +54,33 @@ impl AuthManager for PluginAuthManager {
         state.rt.store().get(id).map(|c| host_auth(&state, &c))
     }
 
-    /// Under the disk lock (the auth-file writes and reloads lock): the host writes the
-    /// file, the file store rewrites it in its canonical form, and the file's
+    /// After plugin parsing, under the disk lock and shared credential-file lease:
+    /// the host writes the file, the file store rewrites it in its canonical form, and the file's
     /// credentials are registered or replaced alone, keeping their runtime state by ID;
     /// the file's other credentials go. Nothing else is reloaded and the config is not
     /// republished.
     fn save(&self, auths: SavedAuths, write: &mut dyn FnMut() -> Result<(), String>) -> Result<(), String> {
-        let Some(state) = self.0.upgrade() else {
-            return write();
+        let path = match &auths {
+            SavedAuths::BuiltIn(auth) => PathBuf::from(auth.attributes.get("path").cloned().unwrap_or_default()),
+            SavedAuths::Plugin { path, .. } | SavedAuths::Written { path, .. } => path.clone(),
         };
-        let _disk = state.disk.lock().unwrap_or_else(PoisonError::into_inner);
+        if path.as_os_str().is_empty() {
+            return Err("auth file path is unavailable".into());
+        }
+        let state = self.0.upgrade();
+        let _disk = state
+            .as_ref()
+            .map(|state| state.disk.lock().unwrap_or_else(PoisonError::into_inner));
+        // The host completed parsing before this callback, including any nested
+        // saves. Keep the same disk -> file lock order as uploads and login saves.
+        let file = cpa_exec::codex_siwc_bind::CredentialFileLease::acquire_for_write(&path)?;
+        if !file.matches_path(&path)? {
+            return Err("auth file target changed while waiting to save".into());
+        }
         write()?;
+        let Some(state) = state.as_ref() else {
+            return Ok(());
+        };
         let fallbacks = || state.fallbacks.lock().unwrap_or_else(PoisonError::into_inner);
         let (path, credentials, refresh) = match auths {
             SavedAuths::Written { path, data } => {
@@ -72,8 +88,7 @@ impl AuthManager for PluginAuthManager {
                 return Ok(());
             }
             SavedAuths::BuiltIn(auth) => {
-                let path = PathBuf::from(auth.attributes.get("path").cloned().unwrap_or_default());
-                let bytes = persist(&path, &auth.metadata, auth.disabled)?;
+                let bytes = persist(file.path(), &auth.metadata, auth.disabled)?;
                 credentials::note_plugin_auth_write(&path, &bytes);
                 let cfg = state.rt.config();
                 let mut credential = match credentials::from_file(&cfg, &cfg.auth_dir, &path, &bytes) {
@@ -115,9 +130,11 @@ impl AuthManager for PluginAuthManager {
                 let bytes = match (rewrite, credentials.as_mut_slice()) {
                     (true, [one]) => {
                         one.metadata.insert("disabled".into(), one.disabled.into());
-                        persist(&path, &one.metadata, one.disabled)?
+                        persist(file.path(), &one.metadata, one.disabled)?
                     }
-                    _ => std::fs::read(&path).map_err(|e| format!("auth filestore: read existing failed: {e}"))?,
+                    _ => {
+                        std::fs::read(file.path()).map_err(|e| format!("auth filestore: read existing failed: {e}"))?
+                    }
                 };
                 credentials::note_plugin_auth_write(&path, &bytes);
                 fallbacks().remove(&path);
@@ -269,62 +286,72 @@ mod tests {
 
     use super::*;
 
-    /// A plugin's `host.auth.save` writes and publishes under the disk lock, so it cannot
-    /// interleave with a SIWC commit, which holds that lock from its read of the backing
-    /// file to its publication: the save's write waits until the lock is released, and
-    /// the file and the registered credential then agree.
+    /// A plugin's `host.auth.save` waits for both management transactions and an
+    /// external native refresh, then holds the file lease through write/publication.
     #[test]
-    fn a_plugin_save_waits_for_a_commit_holding_the_disk_lock() {
-        let dir = std::env::temp_dir().join(format!("cpa-plugin-save-lock-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("config.yaml");
-        std::fs::write(&path, format!("oauth: {{auth-dir: {}}}\n", dir.display())).unwrap();
-        let cfg = cpa_core::config::Config::load(&path).unwrap();
-        let rt = Arc::new(crate::testing::runtime(
-            cfg,
-            Vec::new(),
-            cpa_exec::Executors {
-                claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:9").unwrap(),
-                codex: Default::default(),
-                devices: Default::default(),
-                openai: Default::default(),
-                google: Default::default(),
-            },
-        ));
-        let state = Management::new(rt, path);
-        let manager = PluginAuthManager(Arc::downgrade(&state));
-        let file = dir.join("saved.json");
-        let auth = HostAuth {
-            attributes: [("path".to_owned(), file.display().to_string())].into(),
-            metadata: serde_json::json!({"type": "claude", "access_token": "saved"})
-                .as_object()
-                .cloned()
-                .unwrap(),
-            ..Default::default()
-        };
-        let commit = state.disk.lock().unwrap();
-        let (wrote, written) = mpsc::channel();
-        let save = std::thread::spawn({
-            let file = file.clone();
-            move || {
-                manager.save(SavedAuths::BuiltIn(Box::new(auth)), &mut || {
-                    wrote.send(()).unwrap();
-                    std::fs::write(&file, r#"{"type":"claude","access_token":"saved"}"#).map_err(|e| e.to_string())
-                })
-            }
-        });
-        assert!(
-            written.recv_timeout(Duration::from_millis(300)).is_err(),
-            "the save wrote while a commit held the disk lock"
-        );
-        assert!(!file.exists());
-        drop(commit);
-        written.recv_timeout(Duration::from_secs(5)).unwrap();
-        save.join().unwrap().unwrap();
-        let on_disk: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
-        let stored = state.rt.store().get("saved.json").unwrap();
-        assert_eq!(on_disk, Value::Object(stored.metadata.clone()));
-        assert_eq!(stored.metadata["access_token"], "saved");
-        let _ = std::fs::remove_dir_all(&dir);
+    fn a_plugin_save_waits_for_disk_and_shared_credential_locks() {
+        use cpa_exec::codex_siwc_bind::CredentialFileLease;
+
+        for shared_file_lock in [false, true] {
+            let dir = std::env::temp_dir().join(format!("cpa-plugin-save-lock-{}", uuid::Uuid::new_v4()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("config.yaml");
+            std::fs::write(&path, format!("oauth: {{auth-dir: {}}}\n", dir.display())).unwrap();
+            let cfg = cpa_core::config::Config::load(&path).unwrap();
+            let rt = Arc::new(crate::testing::runtime(
+                cfg,
+                Vec::new(),
+                cpa_exec::Executors {
+                    claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:9").unwrap(),
+                    codex: Default::default(),
+                    devices: Default::default(),
+                    openai: Default::default(),
+                    google: Default::default(),
+                },
+            ));
+            let state = Management::new(rt, path);
+            let manager = PluginAuthManager(Arc::downgrade(&state));
+            let file = dir.join("saved.json");
+            let original = r#"{"type":"claude","access_token":"old"}"#;
+            std::fs::write(&file, original).unwrap();
+            let auth = HostAuth {
+                attributes: [("path".to_owned(), file.display().to_string())].into(),
+                metadata: serde_json::json!({"type": "claude", "access_token": "saved"})
+                    .as_object()
+                    .cloned()
+                    .unwrap(),
+                ..Default::default()
+            };
+            let commit = (!shared_file_lock).then(|| state.disk.lock().unwrap());
+            let lease = shared_file_lock.then(|| CredentialFileLease::acquire_blocking(&file).unwrap());
+            let (started, waiting) = mpsc::channel();
+            let (wrote, written) = mpsc::channel();
+            let save = std::thread::spawn({
+                let file = file.clone();
+                move || {
+                    started.send(()).unwrap();
+                    manager.save(SavedAuths::BuiltIn(Box::new(auth)), &mut || {
+                        assert!(CredentialFileLease::try_acquire(&file).unwrap().is_none());
+                        wrote.send(()).unwrap();
+                        std::fs::write(&file, r#"{"type":"claude","access_token":"saved"}"#).map_err(|e| e.to_string())
+                    })
+                }
+            });
+            waiting.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(
+                written.recv_timeout(Duration::from_millis(100)).is_err(),
+                "the save wrote while the transaction lock was held (shared file lock: {shared_file_lock})"
+            );
+            assert_eq!(std::fs::read_to_string(&file).unwrap(), original);
+            drop(commit);
+            drop(lease);
+            written.recv_timeout(Duration::from_secs(5)).unwrap();
+            save.join().unwrap().unwrap();
+            let on_disk: Value = serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+            let stored = state.rt.store().get("saved.json").unwrap();
+            assert_eq!(on_disk, Value::Object(stored.metadata.clone()));
+            assert_eq!(stored.metadata["access_token"], "saved");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }

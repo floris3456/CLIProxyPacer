@@ -576,7 +576,7 @@ fn write_binding(state: &Management, flow: &Flow, tokens: &Tokens) -> Result<(),
             return Err("backing account changed".into());
         }
         let bytes = codex_siwc::bind_file(&disk, tokens).ok_or("invalid Codex OAuth file")?;
-        match super::auth_files::save_bytes(state, &current, bytes) {
+        match super::auth_files::save_bytes(state, &current, bytes, &disk) {
             Ok(()) => return Ok(()),
             Err(crate::runtime::PatchError::Stale { .. }) => continue,
             Err(e) => return Err(format!("{e:?}")),

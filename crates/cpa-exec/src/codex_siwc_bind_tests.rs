@@ -13,6 +13,213 @@ fn temp_root() -> PathBuf {
     plain_path(std::fs::canonicalize(root).unwrap())
 }
 
+/// A real second process uses the existing blocking writer while the async lease is
+/// held. Both directions must exclude each other, including after a waiter is cancelled.
+#[cfg(any(unix, windows))]
+#[tokio::test]
+async fn credential_file_lease_process_contention_and_cancelled_waiter() {
+    use std::io::Write as _;
+    use std::process::Stdio;
+    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
+
+    const CHILD_PATH: &str = "CPA_TEST_CREDENTIAL_FILE_LEASE_CHILD";
+    if let Some(path) = std::env::var_os(CHILD_PATH) {
+        let path = PathBuf::from(path);
+        println!("LEASE_CHILD_WAITING");
+        std::io::stdout().flush().unwrap();
+        with_file_lock(&path, || {
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "parent-updated");
+            println!("LEASE_CHILD_LOCKED");
+            std::io::stdout().flush().unwrap();
+            let mut release = String::new();
+            std::io::stdin().read_line(&mut release).unwrap();
+            assert_eq!(release.trim(), "release");
+            std::fs::write(&path, "child-updated").unwrap();
+            Ok(())
+        })
+        .unwrap();
+        return;
+    }
+
+    async fn marker(lines: &mut tokio::io::Lines<BufReader<tokio::process::ChildStdout>>, expected: &str) {
+        loop {
+            let line = lines
+                .next_line()
+                .await
+                .unwrap()
+                .expect("child exited before its marker");
+            if line.ends_with(expected) {
+                return;
+            }
+        }
+    }
+
+    let root = temp_root();
+    let path = root.join("auth/c.json");
+    std::fs::write(&path, "initial").unwrap();
+    let lease = CredentialFileLease::acquire(&path).await.unwrap();
+    assert_eq!(lease.path(), path);
+    assert!(lease.matches_path(&path).unwrap());
+    // Windows canonicalize returns a verbatim path; the lease uses Go's plain form.
+    assert!(lease.matches_path(&std::fs::canonicalize(&path).unwrap()).unwrap());
+    assert!(!lease.matches_path(&root.join("auth/replacement.json")).unwrap());
+    assert!(lease.matches_path(&root.join("missing-parent/c.json")).is_err());
+    let mut child = tokio::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "codex_siwc_bind::tests::credential_file_lease_process_contention_and_cancelled_waiter",
+            "--nocapture",
+        ])
+        .env(CHILD_PATH, &path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
+    tokio::time::timeout(Duration::from_secs(10), marker(&mut lines, "LEASE_CHILD_WAITING"))
+        .await
+        .expect("child started");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), marker(&mut lines, "LEASE_CHILD_LOCKED"))
+            .await
+            .is_err(),
+        "the blocking writer entered while another process held the lease"
+    );
+    std::fs::write(lease.path(), "parent-updated").unwrap();
+    drop(lease);
+    tokio::time::timeout(Duration::from_secs(5), marker(&mut lines, "LEASE_CHILD_LOCKED"))
+        .await
+        .expect("child acquired the released lease");
+    assert!(
+        CredentialFileLease::try_acquire(&path).unwrap().is_none(),
+        "a best-effort writer must skip the child-held lease immediately"
+    );
+
+    // Dropping this timed-out future must abandon the wait, without a blocking task
+    // that can later return a forgotten locked handle.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), CredentialFileLease::acquire(&path))
+            .await
+            .is_err(),
+        "the async writer entered while the child held the lease"
+    );
+    child.stdin.take().unwrap().write_all(b"release\n").await.unwrap();
+    let output = tokio::time::timeout(Duration::from_secs(10), child.wait_with_output())
+        .await
+        .expect("child exited")
+        .unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let lease = tokio::time::timeout(Duration::from_secs(5), CredentialFileLease::acquire(&path))
+        .await
+        .expect("cancelled waiter left no lock behind")
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(lease.path()).unwrap(), "child-updated");
+    drop(lease);
+    assert!(
+        root.join("auth/c.json.lock").is_file(),
+        "the shared lock inode stays in place"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        assert_eq!(
+            std::fs::metadata(root.join("auth/c.json.lock"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn credential_file_lease_resolves_file_and_parent_symlink_aliases() {
+    let root = temp_root();
+    let path = root.join("auth/c.json");
+    std::fs::write(&path, "initial").unwrap();
+    let alias = root.join("auth/alias.json");
+    std::os::unix::fs::symlink(&path, &alias).unwrap();
+    let alias_dir = root.join("alias-auth");
+    std::os::unix::fs::symlink(root.join("auth"), &alias_dir).unwrap();
+    // Current Go also resolves the parent when the credential has not been created yet.
+    for (path, alias) in [(path, alias), (root.join("auth/new.json"), alias_dir.join("new.json"))] {
+        let lease = CredentialFileLease::acquire(&path).await.unwrap();
+        assert_eq!(lease.path(), path);
+        assert!(lease.matches_path(&alias).unwrap());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), CredentialFileLease::acquire(&alias))
+                .await
+                .is_err(),
+            "a symlink alias must contend on the same lock"
+        );
+        drop(lease);
+        let alias_lease = CredentialFileLease::acquire(&alias).await.unwrap();
+        assert_eq!(alias_lease.path(), path);
+        drop(alias_lease);
+    }
+    assert!(
+        std::fs::symlink_metadata(root.join("auth/alias.json"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    let lease = CredentialFileLease::acquire(&root.join("auth/c.json")).await.unwrap();
+    std::fs::write(root.join("auth/replacement.json"), "replacement").unwrap();
+    std::fs::remove_file(root.join("auth/alias.json")).unwrap();
+    std::os::unix::fs::symlink(root.join("auth/replacement.json"), root.join("auth/alias.json")).unwrap();
+    assert!(!lease.matches_path(&root.join("auth/alias.json")).unwrap());
+    drop(lease);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn credential_file_lease_refuses_an_unusable_lock_file() {
+    let root = temp_root();
+    let path = root.join("auth/c.json");
+    std::fs::write(&path, "original").unwrap();
+    std::fs::create_dir(root.join("auth/c.json.lock")).unwrap();
+    let error = CredentialFileLease::acquire(&path)
+        .await
+        .err()
+        .expect("lock open must fail");
+    assert!(error.starts_with("failed to open credential lock file "));
+    assert_eq!(std::fs::read_to_string(path).unwrap(), "original");
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn credential_file_lease_preserves_literal_filename_whitespace() {
+    let root = temp_root();
+    let plain = root.join("auth/c.json");
+    let spaced = root.join("auth/c.json ");
+    std::fs::write(&plain, "plain-credential").unwrap();
+    std::fs::write(&spaced, "spaced-credential").unwrap();
+    let lease = CredentialFileLease::acquire(&spaced).await.unwrap();
+    assert_eq!(lease.path(), spaced);
+    assert!(lease.matches_path(&spaced).unwrap());
+    assert!(!lease.matches_path(&plain).unwrap());
+    assert_eq!(std::fs::read_to_string(lease.path()).unwrap(), "spaced-credential");
+    // Go intentionally trims the lock name, so these distinct files share c.json.lock.
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), CredentialFileLease::acquire(&plain))
+            .await
+            .is_err()
+    );
+    std::fs::write(lease.path(), "spaced-updated").unwrap();
+    drop(lease);
+    assert_eq!(std::fs::read_to_string(&plain).unwrap(), "plain-credential");
+    assert_eq!(std::fs::read_to_string(&spaced).unwrap(), "spaced-updated");
+    assert!(root.join("auth/c.json.lock").is_file());
+    assert!(!root.join("auth/c.json .lock").exists());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
 /// The Go recorder's file layout: `->target` is a symlink, `/` a directory. `false`
 /// when the case needs symlinks this platform cannot make.
 fn write_files(base: &Path, files: &Value, expand: &dyn Fn(&str) -> String) -> bool {

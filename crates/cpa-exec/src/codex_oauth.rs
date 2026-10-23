@@ -326,8 +326,8 @@ impl CodexOAuth {
         Ok((upstream.status, body))
     }
 
-    /// `exchange` keeps Go's `ExchangeCodeForTokens` error texts (status and body);
-    /// refreshes keep the sanitized refresh error.
+    /// Preserve the exchange status and fixed prefix; endpoint bodies can echo codes,
+    /// verifiers or issued tokens. Refreshes retain their sanitized OAuth error code.
     async fn token_request(&self, form: &[(&str, &str)], exchange: bool) -> Result<Tokens, ExecError> {
         // url.Values.Encode sorts keys; callers pass them sorted.
         let body = url::form_urlencoded::Serializer::new(String::new())
@@ -337,10 +337,7 @@ impl CodexOAuth {
             .post(&self.token_url, "application/x-www-form-urlencoded", body.into_bytes())
             .await?;
         if status != 200 && exchange {
-            let message = format!(
-                "token exchange failed with status {status}: {}",
-                String::from_utf8_lossy(&body)
-            );
+            let message = format!("token exchange failed with status {status}");
             return Err(oauth_error(status, &message));
         }
         if status != 200 {
@@ -877,7 +874,9 @@ pub fn write_login(auth_dir: &Path, tokens: &Tokens) -> Result<PathBuf, ExecErro
         return Err(oauth_error(400, "invalid credential email filename"));
     }
     let path = auth_dir.join(&name);
-    if let Ok(raw) = std::fs::read(&path)
+    let file = crate::codex_siwc_bind::CredentialFileLease::acquire_for_write(&path)
+        .map_err(|_| oauth_error(500, "cannot lock codex credential"))?;
+    if let Ok(raw) = std::fs::read(file.path())
         && let Ok(existing) = serde_json::from_slice::<Map<String, Value>>(&raw)
     {
         merge_existing(&mut record, existing);
@@ -885,7 +884,8 @@ pub fn write_login(auth_dir: &Path, tokens: &Tokens) -> Result<PathBuf, ExecErro
     let text = encode_go_json(&Value::Object(record));
     // ponytail: Go truncates in place with default permissions; this writes a 0600 temp
     // file and renames it, like the Claude login.
-    publish(auth_dir, &path, text.as_bytes()).map_err(|_| oauth_error(500, "cannot publish codex credential"))?;
+    publish(file.path().parent().unwrap_or(auth_dir), file.path(), text.as_bytes())
+        .map_err(|_| oauth_error(500, "cannot publish codex credential"))?;
     Ok(path)
 }
 

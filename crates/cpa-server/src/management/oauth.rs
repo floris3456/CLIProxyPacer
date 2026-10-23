@@ -710,7 +710,7 @@ async fn start_claude(state: Arc<Management>, webui: bool) -> Response {
                     let slot = legacy.clone();
                     let write = move |dir: PathBuf, patch| {
                         let (path, old) = ManagedLogin::save(&dir, patch).map_err(|e| exec_text(&e))?;
-                        *slot.lock().unwrap_or_else(PoisonError::into_inner) = old;
+                        *slot.lock().unwrap_or_else(PoisonError::into_inner) = old.map(|old| (path.clone(), old));
                         Ok(path)
                     };
                     let saved = save_if_pending(
@@ -724,7 +724,7 @@ async fn start_claude(state: Arc<Management>, webui: bool) -> Response {
                     .await;
                     let old = legacy.lock().unwrap_or_else(PoisonError::into_inner).take();
                     match (saved, old) {
-                        (Outcome::Saved, Some(old)) => remove_legacy_claude(&worker, old).await,
+                        (Outcome::Saved, Some((canonical, old))) => remove_legacy_claude(&worker, canonical, old).await,
                         (saved, _) => saved,
                     }
                 }
@@ -740,17 +740,19 @@ async fn start_claude(state: Arc<Management>, webui: bool) -> Response {
 /// Go `saveTokenRecord` after the canonical Claude credential is stored: the matching
 /// legacy file is deleted through the token store (`store.Delete`), so a git store
 /// commits the removal its watcher guard would refuse.
-async fn remove_legacy_claude(state: &Arc<Management>, legacy: PathBuf) -> Outcome {
+async fn remove_legacy_claude(state: &Arc<Management>, canonical: PathBuf, legacy: PathBuf) -> Outcome {
     let worker = state.clone();
     let removed = tokio::task::spawn_blocking(move || {
         let _guard = worker.disk.lock().unwrap_or_else(PoisonError::into_inner);
-        if worker.store.is_some() {
-            return worker.store_delete(&legacy);
-        }
-        match std::fs::remove_file(&legacy) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.to_string()),
-            _ => Ok(()),
-        }
+        cpa_exec::claude_login::remove_legacy_if_matching(&canonical, &legacy, |path| {
+            if worker.store.is_some() {
+                return worker.store_delete(path);
+            }
+            match std::fs::remove_file(path) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.to_string()),
+                _ => Ok(()),
+            }
+        })
     })
     .await;
     match removed {
@@ -1219,12 +1221,11 @@ async fn start_xai(state: Arc<Management>) -> Response {
     // Go `saveTokenRecord` through the file token store: merged with an existing file.
     fn save_login(dir: &std::path::Path, record: LoginRecord) -> Result<PathBuf, String> {
         let path = dir.join(&record.file_name);
-        let existing = std::fs::read(&path).ok().filter(|raw| !raw.is_empty());
+        let file = cpa_exec::codex_siwc_bind::CredentialFileLease::acquire_for_write(&path)?;
+        let existing = std::fs::read(file.path()).ok().filter(|raw| !raw.is_empty());
         let document = saved_document(record.metadata, existing.as_deref())?;
         let text = cpa_common::json::GoValue::Object(document).encode_indented();
-        std::fs::create_dir_all(dir)
-            .and_then(|()| super::auth_files::write_file(&path, &text))
-            .map_err(|e| e.to_string())?;
+        super::auth_files::write_file(file.path(), &text).map_err(|e| e.to_string())?;
         Ok(path)
     }
     let worker = state.clone();

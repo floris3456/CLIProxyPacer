@@ -454,7 +454,12 @@ pub(crate) fn inject_current_date(body: &str, date: &str, explicit: bool) -> Str
     let content = rawjson::get(body, &path);
     let date_block = text_block(&date_reminder(date), None);
     if content.kind() == gjson::Kind::String {
-        let user = text_block(content.str(), if explicit { None } else { EPHEMERAL });
+        let cache = if explicit || content.str().trim().is_empty() {
+            None
+        } else {
+            EPHEMERAL
+        };
+        let user = text_block(content.str(), cache);
         return rawjson::set_raw(body, &path, &format!("[{date_block},{user}]"));
     }
     if content.kind() != gjson::Kind::Array {
@@ -468,7 +473,7 @@ pub(crate) fn inject_current_date(body: &str, date: &str, explicit: bool) -> Str
             if date_reminder_prefix(&text) {
                 continue;
             }
-            if !explicit && !cached && !context_reminder(&text) {
+            if !explicit && !cached && !context_reminder(&text) && !text.trim().is_empty() {
                 raw.push(with_ephemeral(block.json()));
                 cached = true;
                 continue;
@@ -750,10 +755,16 @@ pub(crate) fn enforce_cache_limit(body: String, mut max: usize) -> String {
     by_path.iter().fold(out, |body, path| rawjson::delete(&body, path))
 }
 
+fn system_cache_host(block: &rawjson::Value) -> bool {
+    block.kind() == gjson::Kind::Object
+        && matches!(block.get("type").str(), "" | "text")
+        && !block.get("text").str().trim().is_empty()
+}
+
 fn cacheable_system(body: &str) -> bool {
     let system = rawjson::get(body, "system");
     match system.kind() {
-        gjson::Kind::Array => !system.array().is_empty(),
+        gjson::Kind::Array => system.array().iter().any(system_cache_host),
         gjson::Kind::String => !system.str().trim().is_empty(),
         _ => false,
     }
@@ -798,7 +809,10 @@ fn inject_system_cache(body: &str) -> String {
             if items.is_empty() || items.iter().any(|b| valid_cache_control(&b.get("cache_control"))) {
                 return body.to_owned();
             }
-            rawjson::set_raw(body, &format!("system.{}.cache_control", items.len() - 1), MARKER)
+            match items.iter().rposition(system_cache_host) {
+                Some(index) => rawjson::set_raw(body, &format!("system.{index}.cache_control"), MARKER),
+                None => body.to_owned(),
+            }
         }
         gjson::Kind::String if !system.str().trim().is_empty() => {
             rawjson::set_raw(body, "system", &format!("[{}]", text_block(system.str(), EPHEMERAL)))
@@ -807,22 +821,38 @@ fn inject_system_cache(body: &str) -> String {
     }
 }
 
+/// Go lastCacheableClaudeMessageContentBlockIndex: empty text cannot host a
+/// marker, and trailing assistant thinking prevents using an earlier block.
+fn message_cache_host(message: &rawjson::Value) -> Option<usize> {
+    let content = message.get("content");
+    if content.kind() != gjson::Kind::Array {
+        return None;
+    }
+    let assistant = message.get("role").str() == "assistant";
+    for (index, block) in content.array().iter().enumerate().rev() {
+        if block.kind() != gjson::Kind::Object {
+            continue;
+        }
+        let kind = block.get("type");
+        if kind.str() == "text" && block.get("text").str().trim().is_empty() {
+            continue;
+        }
+        match kind.str() {
+            "thinking" | "redacted_thinking" if assistant => return None,
+            "" | "thinking" | "redacted_thinking" => {}
+            _ => return Some(index),
+        }
+    }
+    None
+}
+
 fn eligible_for_rolling_cache(message: &rawjson::Value) -> bool {
     let content = message.get("content");
     if content.kind() == gjson::Kind::String {
-        return true;
+        !content.str().trim().is_empty()
+    } else {
+        message_cache_host(message).is_some()
     }
-    let blocks = content.array();
-    if content.kind() != gjson::Kind::Array || blocks.is_empty() {
-        return false;
-    }
-    if message.get("role").str() != "assistant" {
-        return true;
-    }
-    !matches!(
-        blocks.last().map(|b| b.get("type").str().to_owned()).as_deref(),
-        Some("thinking" | "redacted_thinking")
-    )
 }
 
 fn inject_messages_cache(body: &str) -> String {
@@ -858,9 +888,14 @@ fn inject_messages_cache(body: &str) -> String {
             if blocks.iter().any(|b| valid_cache_control(&b.get("cache_control"))) || blocks.is_empty() {
                 return body.to_owned();
             }
-            rawjson::set_raw(body, &format!("{path}.{}.cache_control", blocks.len() - 1), MARKER)
+            match message_cache_host(&msgs[idx]) {
+                Some(index) => rawjson::set_raw(body, &format!("{path}.{index}.cache_control"), MARKER),
+                None => body.to_owned(),
+            }
         }
-        gjson::Kind::String => rawjson::set_raw(body, &path, &format!("[{}]", text_block(content.str(), EPHEMERAL))),
+        gjson::Kind::String if !content.str().trim().is_empty() => {
+            rawjson::set_raw(body, &path, &format!("[{}]", text_block(content.str(), EPHEMERAL)))
+        }
         _ => body.to_owned(),
     }
 }
@@ -1029,6 +1064,54 @@ mod tests {
             paths,
             ["tools.0", "system.0", "messages.1.content.0", "messages.1.content.1"]
         );
+    }
+
+    #[test]
+    fn automatic_cache_markers_skip_empty_text_and_opaque_thinking() {
+        let empty = r#"{"system":[{"type":"text","text":" \n"}],"tools":[{"name":"lookup"}],"messages":[{"role":"user","content":" \t"}]}"#;
+        let output = ensure_cache_control(empty.to_owned());
+        assert!(rawjson::get(&output, "tools.0.cache_control").exists());
+        assert_eq!(
+            rawjson::get(&output, "system").json(),
+            rawjson::get(empty, "system").json()
+        );
+        assert_eq!(
+            rawjson::get(&output, "messages").json(),
+            rawjson::get(empty, "messages").json()
+        );
+        let trailing = r#"{"system":[{"type":"text","text":"Instructions"},{"type":"text","text":" "}],"messages":[{"role":"user","content":[{"type":"text","text":"Question"},{"type":"text","text":""}]}]}"#;
+        let output = ensure_cache_control(trailing.to_owned());
+        for path in ["system.0.cache_control", "messages.0.content.0.cache_control"] {
+            assert!(rawjson::get(&output, path).exists(), "{path}");
+        }
+        for path in ["system.1", "messages.0.content.1"] {
+            assert_eq!(rawjson::get(&output, path).json(), rawjson::get(trailing, path).json());
+        }
+        for opaque in [
+            r#"{"type":"thinking","thinking":"","signature":"unchanged"}"#,
+            r#"{"type":"redacted_thinking","data":"unchanged"}"#,
+        ] {
+            let assistant = format!(r#"[{{"type":"text","text":"Answer"}},{opaque},{{"type":"text","text":" "}}]"#);
+            let body = format!(
+                r#"{{"messages":[{{"role":"user","content":"Question"}},{{"role":"assistant","content":{assistant}}}]}}"#
+            );
+            let output = inject_messages_cache(&body);
+            assert_eq!(rawjson::get(&output, "messages.1.content").json(), assistant);
+            assert!(rawjson::get(&output, "messages.0.content.0.cache_control").exists());
+        }
+        // Existing caller markers remain authoritative.
+        let caller = rawjson::set_raw(trailing, "messages.0.content.1.cache_control", MARKER);
+        assert_eq!(inject_messages_cache(&caller), caller);
+        for content in [r#"" \t""#, r#"[{"type":"text","text":" \n"}]"#] {
+            let body = format!(r#"{{"messages":[{{"role":"user","content":{content}}}]}}"#);
+            assert_eq!(
+                count_cache_controls(&inject_current_date(&body, "2026-10-23", false)),
+                0
+            );
+        }
+        let output = inject_current_date(trailing, "2026-10-23", false);
+        assert!(rawjson::get(&output, "messages.0.content.1.cache_control").exists());
+        assert!(!rawjson::get(&output, "messages.0.content.2.cache_control").exists());
     }
 
     #[test]
