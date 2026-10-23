@@ -284,10 +284,24 @@ impl DeviceFlow {
         headers.set("X-Msh-Device-Name", hostname().unwrap_or_else(|| "unknown".into()));
         headers.set("X-Msh-Device-Model", device_model());
         headers.set("X-Msh-Device-Id", self.device_id.clone());
-        let upstream = crate::proxy::send(&self.client, url, headers, body, Some(Duration::from_secs(30)))
-            .await
-            .map_err(|_| ExecError::local(502, FailureScope::Transport, "kimi: token request failed"))?;
+        let upstream = crate::proxy::request_once(
+            &self.client,
+            wreq::Method::POST,
+            url,
+            headers,
+            Some(body.into()),
+            Some(Duration::from_secs(30)),
+        )
+        .await
+        .map_err(|_| ExecError::local(502, FailureScope::Transport, "kimi: token request failed"))?;
         let status = upstream.status;
+        if (300..400).contains(&status) {
+            return Err(ExecError::local(
+                502,
+                FailureScope::Transport,
+                "kimi: OAuth endpoint redirects are not allowed",
+            ));
+        }
         let body = crate::proxy::read_all(upstream.body, crate::proxy::MAX_ERROR_BODY, false)
             .await
             .map_err(|_| ExecError::local(502, FailureScope::Transport, "kimi: failed to read token response"))?;
@@ -625,7 +639,8 @@ pub async fn login(provider: &str, cfg: &cpa_core::config::Config, no_browser: b
         .and_then(|r| r.get("proxy-url"))
         .and_then(|v| v.as_str())
         .unwrap_or_default();
-    let client = crate::proxy::GoClients::new(crate::proxy::Hooks::default()).get(&crate::proxy::Proxy::parse(proxy));
+    let client =
+        crate::proxy::GoClients::new(crate::proxy::Hooks::default()).get_checked(&crate::proxy::Proxy::parse(proxy))?;
     let flow = DeviceFlow::new(client, domain, "");
     login_with(flow, provider, &cfg.auth_dir, no_browser).await
 }

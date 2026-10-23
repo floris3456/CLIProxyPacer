@@ -755,7 +755,10 @@ async fn download(rt: &Runtime, video: &str, url: &str) -> Response {
                 .unwrap_or_default(),
         ),
     };
-    let client = DOWNLOADS.get(&proxy);
+    let client = match DOWNLOADS.get_checked(&proxy) {
+        Ok(client) => client,
+        Err(error) => return gateway_error(&String::from_utf8_lossy(&error.body)),
+    };
     let headers = cpa_exec::proxy::GoHeaders::new();
     // `HTTPStatusFromErrorOr(err, http.StatusBadGateway)`: a failed download is a 502
     // unless the error carries its own status.

@@ -586,24 +586,32 @@ pub async fn access_token(client: &wreq::Client, sa: &Map<String, Value>, now: i
     let token_url = token_url.as_str();
     let mut headers = GoHeaders::new();
     headers.set("Content-Type", "application/x-www-form-urlencoded");
-    let upstream = proxy::send(client, token_url, headers, Bytes::from(body), None)
-        .await
-        .map_err(|e| format!("oauth2: cannot fetch token: {}", String::from_utf8_lossy(&e.body)))?;
+    let upstream = proxy::request_once(
+        client,
+        wreq::Method::POST,
+        token_url,
+        headers,
+        Some(Bytes::from(body)),
+        None,
+    )
+    .await
+    .map_err(|e| format!("oauth2: cannot fetch token: {}", String::from_utf8_lossy(&e.body)))?;
     let status = upstream.status;
-    let data = proxy::read_all(upstream.body, 1 << 20, false)
-        .await
-        .map_err(|e| format!("oauth2: cannot fetch token: {}", String::from_utf8_lossy(&e.body)))?;
+    if (300..400).contains(&status) {
+        return Err("oauth2: token endpoint redirects are not allowed".into());
+    }
     if !(200..=299).contains(&status) {
-        // oauth2.RetrieveError: the response status line, then the body.
+        // Unlike Go's oauth2.RetrieveError, omit the endpoint body: it may echo the
+        // signed assertion or tokens, and the executor logs this diagnostic.
         let reason = http::StatusCode::from_u16(status)
             .ok()
             .and_then(|s| s.canonical_reason())
             .unwrap_or_default();
-        return Err(format!(
-            "oauth2: cannot fetch token: {status} {reason}\nResponse: {}",
-            String::from_utf8_lossy(&data)
-        ));
+        return Err(format!("oauth2: cannot fetch token: {status} {reason}"));
     }
+    let data = proxy::read_all(upstream.body, 1 << 20, false)
+        .await
+        .map_err(|e| format!("oauth2: cannot fetch token: {}", String::from_utf8_lossy(&e.body)))?;
     parse_token(&data)
 }
 

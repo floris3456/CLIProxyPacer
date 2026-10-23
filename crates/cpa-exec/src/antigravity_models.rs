@@ -339,10 +339,13 @@ impl Probes {
             {
                 continue;
             }
+            let proxy_url = Proxy::effective_url(credential, cfg);
+            let Ok(client) = clients.get_checked(&Proxy::parse(&proxy_url)) else {
+                tracing::warn!("antigravity model probe skipped: invalid proxy transport");
+                continue;
+            };
             let ticket = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             seen.insert(credential.id.clone(), (credential.revision, ticket));
-            let proxy_url = Proxy::effective_url(credential, cfg);
-            let client = clients.get(&Proxy::parse(&proxy_url));
             let (probes, credential) = (self.clone(), credential.clone());
             runtime.spawn(async move {
                 let hints = shared().fetch(&client, &credential, &proxy_url).await;

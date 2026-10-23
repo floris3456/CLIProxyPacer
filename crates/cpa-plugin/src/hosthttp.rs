@@ -797,7 +797,11 @@ impl Host {
                 ))
             })?
         } else {
-            self.http().clients.go.get(&Proxy::parse(&proxy_url))
+            self.http()
+                .clients
+                .go
+                .get_checked(&Proxy::parse(&proxy_url))
+                .map_err(|_| CallbackError::new("pluginhost: invalid proxy transport"))?
         };
         if profile.disable_auto_compression {
             headers.disable_compression();

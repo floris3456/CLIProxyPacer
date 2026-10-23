@@ -361,16 +361,26 @@ impl XaiAuth {
         self
     }
 
-    /// `http.Client.Do` of a form POST: status and the whole body.
+    /// A credential POST cannot redirect its token or device-code body.
     async fn post_form(&self, url: &str, body: String) -> Result<(u16, Bytes), ()> {
         let mut headers = GoHeaders::new();
         headers.set("User-Agent", "Go-http-client/1.1");
         headers.set("Content-Type", "application/x-www-form-urlencoded");
         headers.set("Accept", "application/json");
-        let upstream = crate::proxy::send(&self.client, &self.target(url)?, headers, body, Some(HTTP_TIMEOUT))
-            .await
-            .map_err(|_| ())?;
+        let upstream = crate::proxy::request_once(
+            &self.client,
+            wreq::Method::POST,
+            &self.target(url)?,
+            headers,
+            Some(body.into()),
+            Some(HTTP_TIMEOUT),
+        )
+        .await
+        .map_err(|_| ())?;
         let status = upstream.status;
+        if (300..400).contains(&status) {
+            return Err(());
+        }
         let body = crate::proxy::read_all(upstream.body, crate::proxy::MAX_ERROR_BODY, false)
             .await
             .map_err(|_| ())?;
@@ -940,7 +950,7 @@ pub async fn login(cfg: &Config, no_browser: bool) -> Result<PathBuf, ExecError>
         .and_then(|r| r.get("proxy-url"))
         .and_then(|v| v.as_str())
         .unwrap_or_default();
-    let client = GoClients::new(Default::default()).get(&Proxy::parse(proxy));
+    let client = GoClients::new(Default::default()).get_checked(&Proxy::parse(proxy))?;
     login_with(XaiAuth::new(client), &cfg.auth_dir, no_browser).await
 }
 

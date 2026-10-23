@@ -190,22 +190,19 @@ pub(super) fn token_for(c: &Credential) -> String {
         .unwrap_or_default()
 }
 
-/// Go `apiCallTransport`: the request's proxy (direct if it cannot be built), else
-/// the first buildable of the credential's own proxy, its API-key config entry's proxy
-/// and the global proxy, else a direct connection. Environment proxies are never
-/// used; `None` only if not even a direct client can be built.
+/// Go `apiCallTransport` precedence: request, credential, API-key config, global,
+/// then direct when none was configured. Environment proxies are never used.
+/// ponytail: an explicit unusable route fails closed instead of falling back to a
+/// lower-priority route or direct transport, including for credential quota probes.
 pub(super) fn client_for(
     state: &Management,
     credential: Option<&Credential>,
     request_proxy: &str,
 ) -> Option<wreq::Client> {
-    let direct = || state.clients.try_get(&Proxy::Direct);
-    let build = |raw: &str| match Proxy::parse(raw) {
-        p @ (Proxy::Url(_) | Proxy::Direct) => state.clients.try_get(&p),
-        Proxy::Inherit | Proxy::Invalid => None,
-    };
+    let build = |raw: &str| state.clients.get_checked(&Proxy::parse(raw)).ok();
+    let request_proxy = request_proxy.trim();
     if !request_proxy.is_empty() {
-        return build(request_proxy).or_else(direct);
+        return build(request_proxy);
     }
     let cfg = state.rt.config();
     let mut candidates: Vec<String> = Vec::new();
@@ -228,11 +225,10 @@ pub(super) fn client_for(
         .and_then(serde_yaml_ng::Value::as_str)
         .unwrap_or_default();
     candidates.push(global.trim().to_owned());
-    candidates
-        .iter()
-        .filter(|p| !p.is_empty())
-        .find_map(|p| build(p))
-        .or_else(direct)
+    match candidates.iter().find(|p| !p.is_empty()) {
+        Some(proxy) => build(proxy),
+        None => state.clients.get_checked(&Proxy::Direct).ok(),
+    }
 }
 
 pub(crate) async fn api_call(
@@ -258,7 +254,7 @@ pub(crate) async fn api_call(
         return fail(StatusCode::BAD_REQUEST, "invalid url");
     }
     let request_proxy = req.proxy_url.trim().to_owned();
-    if !request_proxy.is_empty() && matches!(Proxy::parse(&request_proxy), Proxy::Invalid) {
+    if !request_proxy.is_empty() && Proxy::parse(&request_proxy).validate().is_err() {
         return fail(StatusCode::BAD_REQUEST, "invalid proxy_url");
     }
     let auth_index = req
@@ -390,6 +386,78 @@ pub(crate) async fn api_call(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn explicit_invalid_proxy_never_falls_back_to_another_route() {
+        let dir = std::env::temp_dir().join(format!("cpa-api-call-proxy-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let cfg = cpa_core::config::Config::parse(&format!(
+            "oauth:\n  auth-dir: {}\nrequests:\n  proxy-url: direct\napi-keys:\n  codex:\n    - base-url: http://127.0.0.1:9\n      proxy-url: http://127.0.0.1:0\n      keys: [{{api-key: fake-management-proxy}}]\n",
+            dir.display()
+        ))
+        .unwrap();
+        let state = Management::new(
+            Arc::new(crate::testing::runtime(
+                cfg,
+                Vec::new(),
+                cpa_exec::Executors {
+                    claude: cpa_exec::claude::ClaudeExecutor::new("http://127.0.0.1:9").unwrap(),
+                    codex: Default::default(),
+                    devices: Default::default(),
+                    openai: Default::default(),
+                    google: Default::default(),
+                },
+            )),
+            dir.join("config.yaml"),
+        );
+        let mut credential = Credential::relay_session("proxy-test");
+        for invalid in [
+            "not a proxy",
+            "http://proxy-user:proxy-secret@127.0.0.1:0",
+            "ftp://127.0.0.1:1234",
+        ] {
+            credential.attributes.insert("proxy_url".into(), "direct".into());
+            assert!(client_for(&state, Some(&credential), invalid).is_none());
+            credential.attributes.insert("proxy_url".into(), invalid.into());
+            assert!(client_for(&state, Some(&credential), "").is_none());
+            // An explicit request override still wins over a bad credential route.
+            assert!(client_for(&state, Some(&credential), "direct").is_some());
+
+            let response = api_call(
+                State(state.clone()),
+                Ok(crate::body_limit::FirstJson(Bytes::from(
+                    serde_json::to_vec(&json!({
+                        "method": "GET", "url": "http://127.0.0.1:9/unused", "proxy_url": invalid,
+                    }))
+                    .unwrap(),
+                ))),
+            )
+            .await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let body = axum::body::to_bytes(response.into_body(), 1024).await.unwrap();
+            assert!(!String::from_utf8_lossy(&body).contains("proxy-secret"));
+        }
+        // An empty credential setting still inherits the next configured route.
+        credential.attributes.insert("proxy_url".into(), "  ".into());
+        assert!(client_for(&state, Some(&credential), "").is_some());
+        assert!(client_for(&state, None, "").is_some());
+
+        // A matching API-key config route takes precedence over the valid global one.
+        credential.provider = "codex".into();
+        credential
+            .attributes
+            .insert("api_key".into(), "fake-management-proxy".into());
+        credential
+            .attributes
+            .insert("base_url".into(), "http://127.0.0.1:9".into());
+        assert_eq!(
+            credentials::api_key_config_proxy(&state.rt.config(), &credential),
+            "http://127.0.0.1:0"
+        );
+        assert!(client_for(&state, Some(&credential), "").is_none());
+        drop(state);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn decodes_like_gin_should_bind_json() {

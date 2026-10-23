@@ -439,11 +439,11 @@ fn global_proxy(state: &Management) -> Proxy {
 
 /// The client for login traffic: the global proxy (else the environment's proxies);
 /// local endpoints in tests.
-pub(super) fn login_client(state: &Management) -> wreq::Client {
+pub(super) fn login_client(state: &Management) -> Result<wreq::Client, ExecError> {
     if state.login_base.is_some() {
-        return state.clients.get(&Proxy::Direct);
+        return state.clients.get_checked(&Proxy::Direct);
     }
-    state.clients.get(&global_proxy(state))
+    state.clients.get_checked(&global_proxy(state))
 }
 
 /// Go `StartOAuthV8`.
@@ -690,8 +690,12 @@ async fn start_claude(state: Arc<Management>, webui: bool) -> Response {
         if let Some(code) = wait_for_callback(&worker, &login.state, "anthropic", "Bad request").await {
             let exchanged = match &worker.login_base {
                 Some(base) => {
+                    let client = match login_client(&worker) {
+                        Ok(client) => client,
+                        Err(error) => return fail_session(&worker, &login.state, &exec_text(&error)),
+                    };
                     let oauth = cpa_exec::oauth::OAuth::with_endpoints(
-                        login_client(&worker),
+                        client,
                         &format!("{base}/v1/oauth/token"),
                         &format!("{base}/api/oauth/profile"),
                         &format!("{base}/api/oauth/claude_cli/roles"),
@@ -782,7 +786,10 @@ async fn start_codex(state: Arc<Management>, webui: bool) -> Response {
     let flow = sid.clone();
     tokio::spawn(async move {
         if let Some(code) = wait_for_callback(&worker, &flow, "codex", "Bad Request").await {
-            let client = login_client(&worker);
+            let client = match login_client(&worker) {
+                Ok(client) => client,
+                Err(error) => return fail_session(&worker, &flow, &exec_text(&error)),
+            };
             let oauth = match &worker.login_base {
                 Some(base) => CodexOAuth::with_endpoints(
                     client,
@@ -852,7 +859,10 @@ async fn start_antigravity(state: Arc<Management>, webui: bool) -> Response {
                 if cb.code.is_empty() {
                     return Outcome::Failed("Authentication failed: code not found".into());
                 }
-                let client = login_client(&worker);
+                let client = match login_client(&worker) {
+                    Ok(client) => client,
+                    Err(error) => return Outcome::Failed(exec_text(&error)),
+                };
                 let oauth = match &worker.login_base {
                     Some(base) => OAuth::with_endpoints(
                         client,
@@ -954,7 +964,11 @@ async fn start_devin(state: Arc<Management>) -> Response {
     let Some(sid) = random_state() else {
         return fail(StatusCode::INTERNAL_SERVER_ERROR, "failed to generate state parameter");
     };
-    let mut auth = DevinAuth::new(login_client(&state));
+    let client = match login_client(&state) {
+        Ok(client) => client,
+        Err(error) => return fail(StatusCode::BAD_GATEWAY, exec_text(&error)),
+    };
+    let mut auth = DevinAuth::new(client);
     if let Some(base) = &state.login_base {
         auth = auth.with_app_base(base).with_api_base(base).with_server_base(base);
     }
@@ -1054,7 +1068,11 @@ async fn start_kimi(state: Arc<Management>, domain: String) -> Response {
         ("kimi", "kmi")
     };
     let sid = format!("{prefix}-{}", unix_nanos());
-    let mut flow = DeviceFlow::new(login_client(&state), &domain, "");
+    let client = match login_client(&state) {
+        Ok(client) => client,
+        Err(error) => return fail(StatusCode::BAD_GATEWAY, exec_text(&error)),
+    };
+    let mut flow = DeviceFlow::new(client, &domain, "");
     if let Some(base) = &state.login_base {
         flow = flow.with_oauth_host(base);
     }
@@ -1116,7 +1134,11 @@ async fn start_meta(state: Arc<Management>) -> Response {
     use cpa_exec::meta_auth::{MetaAuth, create_token_storage, save_login};
     const MAX_POLL_SECONDS: i64 = 15 * 60;
     let sid = format!("meta-{}", unix_nanos());
-    let mut auth = MetaAuth::new(login_client(&state));
+    let client = match login_client(&state) {
+        Ok(client) => client,
+        Err(error) => return fail(StatusCode::BAD_GATEWAY, exec_text(&error)),
+    };
+    let mut auth = MetaAuth::new(client);
     if let Some(base) = &state.login_base {
         auth = auth
             .with_auth_host(base)
@@ -1167,7 +1189,11 @@ async fn start_meta(state: Arc<Management>) -> Response {
 async fn start_xai(state: Arc<Management>) -> Response {
     use cpa_exec::xai_auth::{LoginRecord, MAX_POLL_DURATION, XaiAuth, login_record, saved_document};
     let sid = format!("xai-{}", unix_nanos());
-    let mut auth = XaiAuth::new(login_client(&state));
+    let client = match login_client(&state) {
+        Ok(client) => client,
+        Err(error) => return fail(StatusCode::BAD_GATEWAY, exec_text(&error)),
+    };
+    let mut auth = XaiAuth::new(client);
     if let Some(base) = &state.login_base {
         auth = auth
             .with_issuer_origin(base)

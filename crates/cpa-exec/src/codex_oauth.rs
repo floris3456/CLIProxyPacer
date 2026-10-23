@@ -295,8 +295,9 @@ impl CodexOAuth {
         Self { client, ..self.clone() }
     }
 
-    /// Posts a form or JSON body as Go's `http.Client.Do` does (Go net/http headers,
-    /// redirects followed, transparent gzip). Returns the status and a bounded body;
+    /// Posts a form or JSON body with Go net/http headers and transparent gzip.
+    /// Fixed OAuth endpoints cannot redirect a code, verifier or refresh-token body
+    /// to another recipient. Returns the status and a bounded body;
     /// transport faults never echo URLs or payloads.
     pub(crate) async fn post(
         &self,
@@ -308,9 +309,17 @@ impl CodexOAuth {
         let mut headers = crate::proxy::GoHeaders::new();
         headers.set("Content-Type", content_type);
         headers.set("Accept", "application/json");
-        let upstream = crate::proxy::send(&self.client, url, headers, body, None)
-            .await
-            .map_err(|_| failed())?;
+        let upstream =
+            crate::proxy::request_once(&self.client, wreq::Method::POST, url, headers, Some(body.into()), None)
+                .await
+                .map_err(|_| failed())?;
+        if (300..400).contains(&upstream.status) {
+            return Err(ExecError::local(
+                502,
+                FailureScope::Transport,
+                "codex oauth endpoint redirects are not allowed",
+            ));
+        }
         let body = crate::proxy::read_all(upstream.body, crate::proxy::MAX_ERROR_BODY, false)
             .await
             .map_err(|_| failed())?;

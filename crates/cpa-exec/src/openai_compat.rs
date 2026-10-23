@@ -310,7 +310,7 @@ impl OpenAICompatExecutor {
             headers.set("Accept", "text/event-stream");
             headers.set("Cache-Control", "no-cache");
         }
-        let client = self.clients.for_credential(credential, cfg);
+        let client = self.clients.for_credential(credential, cfg)?;
         let url = endpoint(&base_url, path);
         let capture = wire::Capture::request(
             &req,
@@ -457,7 +457,7 @@ impl OpenAICompatExecutor {
             headers.set("Cache-Control", "no-cache");
         }
         apply_custom(&mut headers, credential, &req);
-        let client = self.clients.for_credential(credential, cfg);
+        let client = self.clients.for_credential(credential, cfg)?;
         let url = endpoint(&base_url, path);
         let capture = wire::Capture::request(
             &req,

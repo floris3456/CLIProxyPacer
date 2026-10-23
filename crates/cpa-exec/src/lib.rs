@@ -9,15 +9,10 @@
 //! check, and [`Executors::prepare`] does the work and returns a [`MetadataPatch`] that
 //! the runtime commits. Executors never write credential files themselves.
 //!
-//! [`Readiness`] separates the two reasons Go prepares a credential. Requests block only
-//! on [`Readiness::PrepareNow`] (Go `RequestAuthPreparer`: Claude identity, Meta API-key
-//! mint, Antigravity project ID; also an Antigravity token inside five minutes of
-//! expiry, which Go's executor refreshes inline). Token refresh is
-//! [`Readiness::RefreshSoon`]: the
-//! background loop refreshes inside the provider's refresh lead while requests keep
-//! using the current token, and an upstream 401 triggers one refresh-and-retry (Go
-//! `tryRefreshAfterUnauthorized`). An already expired token is still `RefreshSoon`:
-//! Go sends it and recovers on 401.
+//! Requests wait on [`Readiness::PrepareNow`] for missing identity, a required mint,
+//! or an expired access token that can refresh. Valid tokens refresh in the background
+//! inside the provider's lead. An unexpected upstream 401 allows one refresh-and-retry
+//! unless a request-scoped error rule handles it.
 
 pub mod aistudio;
 pub mod antigravity;
@@ -72,6 +67,8 @@ pub mod meta_auth;
 mod meta_codex;
 mod meta_wire;
 pub mod oauth;
+#[cfg(test)]
+mod oauth_redirect_tests;
 pub mod openai_compat;
 mod openai_compat_go;
 mod openai_compat_http;
@@ -128,6 +125,35 @@ pub enum Readiness {
     PrepareNow,
 }
 
+/// Expiry of the token used for inference, not a different Codex token partition.
+/// API keys and tokens with unknown expiry are left to their provider's validation.
+pub fn access_token_expired(credential: &Credential, now: chrono::DateTime<chrono::Utc>) -> bool {
+    if credential.provider == "codex" && codex_siwc::enabled(credential) {
+        return !codex_siwc::access_token(credential).is_empty() && !codex_siwc::access_usable(credential, now);
+    }
+    let api_key = credential
+        .attributes
+        .get("api_key")
+        .map(String::as_str)
+        .unwrap_or_default();
+    let stored = credential.str("access_token").unwrap_or_default();
+    let token = match credential.provider.as_str() {
+        "claude" if api_key.is_empty() && stored.contains("sk-ant-oat") => stored,
+        "codex" if api_key.is_empty() && !cpa_core::registry::dynamic::is_api_key(credential) => stored,
+        xai::PROVIDER if api_key.trim().is_empty() && !cpa_core::registry::dynamic::is_api_key(credential) => stored,
+        antigravity::PROVIDER => stored,
+        p if kimi::PROVIDERS.contains(&p) => {
+            if stored.trim().is_empty() && credential.attributes.get("access_token").is_none_or(String::is_empty) {
+                return false;
+            }
+            kimi::access_token(credential)
+        }
+        // These fields are API keys, mint grants, or unused on other providers.
+        _ => return false,
+    };
+    !token.trim().is_empty() && kimi_http::token_expiration(token, credential).is_some_and(|expiry| expiry <= now)
+}
+
 pub struct Executors {
     pub claude: claude::ClaudeExecutor,
     pub codex: codex::CodexExecutor,
@@ -175,6 +201,7 @@ impl Executors {
         req: ExecRequest,
         cfg: &Config,
     ) -> Result<ExecResponse, ExecError> {
+        proxy::Proxy::effective(credential, cfg).validate()?;
         match credential.provider.as_str() {
             "claude" => self.claude.execute(credential, req, cfg).await,
             "codex" => self.codex.execute(credential, req, cfg).await,
@@ -201,6 +228,7 @@ impl Executors {
         request_path: &str,
         cfg: &Config,
     ) -> Result<ExecResponse, ExecError> {
+        proxy::Proxy::effective(credential, cfg).validate()?;
         match credential.provider.as_str() {
             "codex" => self.codex.images(credential, req, request_path, cfg).await,
             p if openai_compat::handles(p) => self.openai.compat.images(credential, req, request_path, cfg).await,
@@ -219,6 +247,7 @@ impl Executors {
         request_path: &str,
         cfg: &Config,
     ) -> Result<ExecResponse, ExecError> {
+        proxy::Proxy::effective(credential, cfg).validate()?;
         match credential.provider.as_str() {
             xai::PROVIDER => self.openai.xai.videos(credential, req, request_path, cfg).await,
             other => Err(no_executor(other)),
@@ -233,6 +262,7 @@ impl Executors {
         req: ExecRequest,
         cfg: &Config,
     ) -> Result<ExecResponse, ExecError> {
+        proxy::Proxy::effective(credential, cfg).validate()?;
         match credential.provider.as_str() {
             xai::PROVIDER => self.openai.xai.speech(credential, req, cfg).await,
             other => Err(no_executor(other)),
@@ -250,6 +280,7 @@ impl Executors {
         cfg: &Config,
         session: &ExecSession,
     ) -> Result<ExecResponse, ExecError> {
+        proxy::Proxy::effective(credential, cfg).validate()?;
         match credential.provider.as_str() {
             "codex" => self.codex.execute_in_session(credential, req, cfg, session).await,
             xai::PROVIDER => self.openai.xai.execute_in_session(credential, req, cfg, session).await,
@@ -337,7 +368,11 @@ impl Executors {
     /// Must be cheap and side-effect free. Providers without request-time preparation
     /// report `RefreshSoon` whenever `needs_prepare` holds.
     pub fn readiness(&self, credential: &Credential, cfg: &Config) -> Readiness {
-        if !self.needs_prepare(credential, cfg) {
+        let now = chrono::Utc::now();
+        if self.has_refresh_credential(credential) && access_token_expired(credential, now) {
+            return Readiness::PrepareNow;
+        }
+        if !self.needs_prepare_at(credential, cfg, now) {
             return Readiness::Ready;
         }
         match credential.provider.as_str() {
@@ -413,7 +448,10 @@ impl Executors {
     /// once its identity is known, Kimi, Meta, Devin) refresh whenever asked.
     pub async fn prepare_forced(&self, credential: &Credential, cfg: &Config) -> Result<MetadataPatch, ExecError> {
         match credential.provider.as_str() {
-            "codex" => self.codex.refresh_now(credential, cfg).await,
+            "codex" => {
+                proxy::Proxy::effective(credential, cfg).validate()?;
+                self.codex.refresh_now(credential, cfg).await
+            }
             _ => self.prepare(credential, cfg).await,
         }
     }
@@ -422,13 +460,17 @@ impl Executors {
     /// Codex refreshes every token partition that can refresh.
     pub async fn prepare_management(&self, credential: &Credential, cfg: &Config) -> Result<MetadataPatch, ExecError> {
         match credential.provider.as_str() {
-            "codex" => self.codex.refresh_all(credential, cfg).await,
+            "codex" => {
+                proxy::Proxy::effective(credential, cfg).validate()?;
+                self.codex.refresh_all(credential, cfg).await
+            }
             _ => self.prepare_forced(credential, cfg).await,
         }
     }
 
     /// Prepares `credential` and returns the metadata change to commit.
     pub async fn prepare(&self, credential: &Credential, cfg: &Config) -> Result<MetadataPatch, ExecError> {
+        proxy::Proxy::effective(credential, cfg).validate()?;
         match credential.provider.as_str() {
             "claude" => self.claude.prepare(credential, cfg).await,
             "codex" => self.codex.prepare(credential, cfg).await,
@@ -452,7 +494,7 @@ fn no_executor(provider: &str) -> ExecError {
 
 #[cfg(test)]
 mod readiness_tests {
-    use super::{Executors, Readiness, claude};
+    use super::{Executors, Readiness, access_token_expired, claude};
     use cpa_core::config::Config;
     use cpa_core::credential::Credential;
     use std::path::Path;
@@ -470,11 +512,90 @@ mod readiness_tests {
         (chrono::Utc::now() + offset).to_rfc3339()
     }
 
-    /// Requests block only on Go `ShouldPrepareRequestAuth` (Claude: an OAuth token
-    /// without a canonical device pool or account UUID). Expiry, even past expiry, is a
-    /// background refresh.
+    #[tokio::test]
+    async fn invalid_proxy_blocks_provider_dispatch_and_preparation() {
+        use cpa_core::exec::{Caller, ExecRequest, FailureScope, Operation};
+        use cpa_core::format::Format;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let executors = Executors {
+            claude: claude::ClaudeExecutor::new(&endpoint).unwrap(),
+            codex: Default::default(),
+            devices: Default::default(),
+            openai: Default::default(),
+            google: Default::default(),
+        };
+        let request = ExecRequest {
+            operation: Operation::Generate,
+            source_format: Format::OpenAI,
+            response_format: Format::OpenAI,
+            requested_model: "test-model".into(),
+            model: "test-model".into(),
+            original_body: "{}".into(),
+            body: "{}".into(),
+            stream: false,
+            stream_payloads: false,
+            alt: None,
+            session: None,
+            execution_session: None,
+            derived_session: None,
+            request_path: String::new(),
+            headers: Default::default(),
+            caller: Caller {
+                principal: String::new(),
+                source: "",
+                provider: String::new(),
+            },
+            resolved_model: None,
+            usage: Default::default(),
+        };
+        let cfg = Config::default();
+        for provider in [
+            "claude",
+            "codex",
+            "kimi",
+            "meta",
+            "devin",
+            "gemini",
+            "vertex",
+            "aistudio",
+            "antigravity",
+            "xai",
+            "openai",
+        ] {
+            let mut c = credential(serde_json::json!({
+                "type": provider, "access_token": "test-token", "refresh_token": "test-refresh"
+            }));
+            c.attributes.insert("base_url".into(), endpoint.clone());
+            c.attributes
+                .insert("proxy_url".into(), "unsupported://user:secret@proxy.invalid".into());
+            let dispatch = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                executors.execute(&c, request.clone(), &cfg),
+            )
+            .await
+            .expect("proxy rejection must precede I/O")
+            .err()
+            .expect("invalid proxy accepted");
+            let preparation = executors.prepare(&c, &cfg).await.unwrap_err();
+            for error in [dispatch, preparation] {
+                assert_eq!(error.status, 502, "{provider}");
+                assert_eq!(error.scope, FailureScope::Transport, "{provider}");
+                assert!(!error.to_string().contains("secret"));
+            }
+        }
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(25), listener.accept())
+                .await
+                .is_err()
+        );
+    }
+
+    /// Valid tokens refresh in the background; missing identity and expired tokens
+    /// must be prepared before dispatch.
     #[test]
-    fn only_missing_identity_blocks_requests() {
+    fn missing_identity_and_expired_tokens_block_requests() {
         let executors = Executors {
             claude: claude::ClaudeExecutor::new("http://127.0.0.1:1").unwrap(),
             codex: Default::default(),
@@ -497,7 +618,7 @@ mod readiness_tests {
         let cases = [
             (identified(rfc3339(chrono::Duration::days(2))), Readiness::Ready),
             (identified(rfc3339(chrono::Duration::hours(1))), Readiness::RefreshSoon),
-            (identified(rfc3339(-chrono::Duration::hours(1))), Readiness::RefreshSoon),
+            (identified(rfc3339(-chrono::Duration::hours(1))), Readiness::PrepareNow),
             (
                 credential(serde_json::json!({
                     "type": "claude",
@@ -518,7 +639,7 @@ mod readiness_tests {
                     "refresh_token": "fake-refresh",
                     "expired": rfc3339(-chrono::Duration::hours(1)),
                 })),
-                Readiness::RefreshSoon,
+                Readiness::PrepareNow,
             ),
             // Antigravity: requests wait for the project ID and for a token valid five
             // more minutes (Go's inline refresh); otherwise the token refreshes 30
@@ -593,6 +714,76 @@ mod readiness_tests {
         for (i, (c, expected)) in cases.iter().enumerate() {
             assert_eq!(executors.readiness(c, &cfg), *expected, "case {i}");
         }
+    }
+
+    #[test]
+    fn expiry_checks_the_selected_token_partition() {
+        let now = chrono::Utc::now();
+        let past = (now - chrono::Duration::hours(1)).to_rfc3339();
+        let future = (now + chrono::Duration::days(7)).to_rfc3339();
+        let mut c = credential(serde_json::json!({
+            "type": "codex", "access_token": "outer", "expired": past,
+            "use_siwc": true,
+            "siwc": {"access_token": "inner", "expired": future}
+        }));
+        assert!(
+            !access_token_expired(&c, now),
+            "inactive outer expiry must not block SIWC"
+        );
+        c.metadata.insert("use_siwc".into(), false.into());
+        assert!(access_token_expired(&c, now));
+        c.metadata.insert("expired".into(), future.into());
+        c.metadata.get_mut("siwc").unwrap()["expired"] = past.into();
+        assert!(
+            !access_token_expired(&c, now),
+            "inactive SIWC expiry must not block outer"
+        );
+        c.metadata.insert("use_siwc".into(), true.into());
+        assert!(access_token_expired(&c, now));
+        c.attributes.insert("api_key".into(), "configured-api-key".into());
+        assert!(
+            access_token_expired(&c, now),
+            "SIWC takes precedence over the outer API key"
+        );
+        c.metadata.insert("use_siwc".into(), false.into());
+        assert!(!access_token_expired(&c, now), "API keys do not use OAuth expiry");
+    }
+
+    #[test]
+    fn expiry_ignores_inactive_tokens_and_api_key_fields() {
+        let now = chrono::Utc::now();
+        let past = (now - chrono::Duration::hours(1)).to_rfc3339();
+        for provider in [
+            "gemini",
+            "vertex",
+            "meta",
+            "devin",
+            "openai",
+            "aistudio",
+            "plugin-provider",
+        ] {
+            let c =
+                credential(serde_json::json!({"type":provider,"access_token":"inactive-or-api-key","expired":past}));
+            assert!(!access_token_expired(&c, now), "{provider}");
+        }
+        let mut c = credential(serde_json::json!({"type":"kimi","access_token":"selected-oauth-token","expired":past}));
+        c.attributes.insert("api_key".into(), "inactive-key".into());
+        assert!(access_token_expired(&c, now), "Kimi selects its metadata token first");
+        c.metadata.remove("access_token");
+        assert!(
+            !access_token_expired(&c, now),
+            "Kimi API-key fallback has no OAuth expiry"
+        );
+        c.metadata.insert("access_token".into(), "selected-oauth-token".into());
+        c.provider = "antigravity".into();
+        assert!(access_token_expired(&c, now), "Antigravity ignores API-key attributes");
+        c.provider = "claude".into();
+        c.attributes.clear();
+        c.metadata.insert("access_token".into(), "sk-ant-api03-key".into());
+        assert!(
+            !access_token_expired(&c, now),
+            "a Claude API key is not an OAuth access token"
+        );
     }
 
     /// The refresh loop sleeps until `prepare_due`: each provider's own lead before

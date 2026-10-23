@@ -142,7 +142,13 @@ fn check_request(name: &str, wire: &str, go: &Value) {
         (go["method"].as_str().unwrap(), want_target.as_str()),
         "{name}"
     );
-    assert_eq!(body, go["body"].as_str().unwrap(), "{name}: body");
+    // These immutable captures predate the Hub identity update. Onboarding must
+    // advertise the same current version in its metadata and User-Agent.
+    let expected_body = go["body"].as_str().unwrap().replace(
+        "\"ide_version\":\"2.9.1\"",
+        &format!("\"ide_version\":\"{}\"", crate::antigravity_version::latest_version()),
+    );
+    assert_eq!(body, expected_body, "{name}: body");
     let wire_headers: Vec<(String, String)> = lines
         .filter_map(|l| l.split_once(": "))
         .map(|(n, v)| (n.to_ascii_lowercase(), v.to_owned()))
@@ -156,7 +162,10 @@ fn check_request(name: &str, wire: &str, go: &Value) {
         .map(|h| {
             (
                 h[0].as_str().unwrap().to_ascii_lowercase(),
-                h[1].as_str().unwrap().to_owned(),
+                h[1].as_str().unwrap().replace(
+                    "antigravity/hub/2.9.1 darwin/arm64",
+                    &crate::antigravity_version::user_agent(),
+                ),
             )
         })
         .collect();

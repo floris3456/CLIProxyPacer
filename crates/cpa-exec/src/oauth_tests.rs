@@ -129,7 +129,11 @@ async fn refresh_rotation_preserves_identity_on_optional_profile_failure() {
     });
     let oauth = service(mock.clone()).await;
     let mut credential = credential();
-    // Identity preparation never refreshes, even inside the refresh lead.
+    credential.metadata.insert(
+        "expired".into(),
+        timestamp(Utc::now() + chrono::Duration::hours(1)).into(),
+    );
+    // A valid token still prepares identity first, even inside the refresh lead.
     assert!(refresh_due(&credential, Utc::now()));
     let prepared = oauth.prepare(&credential, &crate::proxy::Proxy::Inherit).await.unwrap();
     assert_eq!(prepared.set.keys().collect::<Vec<_>>(), ["claude_device_ids"]);
@@ -151,6 +155,33 @@ async fn refresh_rotation_preserves_identity_on_optional_profile_failure() {
     let calls = mock.calls.lock().unwrap();
     assert_eq!(calls.len(), 2);
     assert_eq!(calls[0].2, format!(r#"{{"client_id":"{CLIENT_ID}","grant_type":"refresh_token","refresh_token":"fake-refresh","scope":"{SCOPE}"}}"#).as_bytes());
+    assert_eq!(calls[1].1["authorization"], "Bearer sk-ant-oat-new-fake");
+}
+
+#[tokio::test]
+async fn expired_missing_identity_refreshes_before_profile_and_retains_rotation() {
+    let mock = Arc::new(Mock {
+        profile_status: 503,
+        ..Default::default()
+    });
+    let oauth = service(mock.clone()).await;
+    let mut credential = credential();
+    credential.metadata.remove("account_uuid");
+    assert!(needs_identity(&credential));
+    let patch = oauth.prepare(&credential, &Proxy::Inherit).await.unwrap();
+    // Optional profile failure cannot hide a successful token rotation. Device and
+    // account preparation can run only after the caller commits this patch.
+    assert_eq!(patch.set["access_token"], "sk-ant-oat-new-fake");
+    assert_eq!(patch.set["refresh_token"], "fake-rotated");
+    assert!(!patch.set.contains_key("claude_device_ids"));
+    patch.apply(&mut credential.metadata);
+    assert!(!crate::access_token_expired(&credential, Utc::now()));
+    assert!(needs_identity(&credential));
+    let calls = mock.calls.lock().unwrap();
+    assert_eq!(
+        calls.iter().map(|call| call.0.as_str()).collect::<Vec<_>>(),
+        ["/token", "/profile"]
+    );
     assert_eq!(calls[1].1["authorization"], "Bearer sk-ant-oat-new-fake");
 }
 

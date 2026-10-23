@@ -302,6 +302,27 @@ impl OAuth {
         .await
     }
 
+    /// Token grants stay at their fixed endpoint, including on 307/308 responses.
+    async fn post_token(&self, headers: GoHeaders, body: Vec<u8>) -> Result<Upstream, ExecError> {
+        let upstream = proxy::request_once(
+            &self.client,
+            wreq::Method::POST,
+            &self.token_endpoint,
+            headers,
+            Some(Bytes::from(body)),
+            None,
+        )
+        .await?;
+        if (300..400).contains(&upstream.status) {
+            return Err(ExecError::local(
+                502,
+                FailureScope::Transport,
+                "antigravity token endpoint redirects are not allowed",
+            ));
+        }
+        Ok(upstream)
+    }
+
     /// `ExchangeCodeForTokens`.
     pub async fn exchange_code(&self, code: &str, redirect_uri: &str) -> Result<Tokens, AuthError> {
         const STEP: &str = "antigravity token exchange";
@@ -315,7 +336,7 @@ impl OAuth {
         let mut headers = GoHeaders::new();
         headers.set("Content-Type", "application/x-www-form-urlencoded");
         let upstream = self
-            .post(&self.token_endpoint, headers, form.into_bytes(), None)
+            .post_token(headers, form.into_bytes())
             .await
             .map_err(|e| AuthError::plain(format!("{STEP}: execute request: {}", transport_text(&e))))?;
         let status = upstream.status;
@@ -502,9 +523,7 @@ impl OAuth {
         headers.set("Host", "oauth2.googleapis.com");
         headers.set("Content-Type", "application/x-www-form-urlencoded");
         headers.set("User-Agent", "Go-http-client/2.0");
-        let upstream = self
-            .post(&self.token_endpoint, headers, form.into_bytes(), None)
-            .await?;
+        let upstream = self.post_token(headers, form.into_bytes()).await?;
         let status = upstream.status;
         let data = proxy::read_all(upstream.body, usize::MAX, false).await?;
         if !(200..300).contains(&status) {
@@ -707,7 +726,7 @@ pub(crate) async fn prepare(
     credential: &Credential,
     cfg: &Config,
 ) -> Result<MetadataPatch, ExecError> {
-    let oauth = OAuth::new(clients.get(&Proxy::effective(credential, cfg)));
+    let oauth = OAuth::new(clients.get_checked(&Proxy::effective(credential, cfg))?);
     let now = Utc::now();
     let mut patch = MetadataPatch::default();
     let mut access = meta_string(credential, "access_token").to_owned();
@@ -971,7 +990,11 @@ pub async fn login(auth_dir: &Path, cfg: &Config, options: &LoginOptions) -> Res
                 .and_then(serde_yaml_ng::Value::as_str)
                 .unwrap_or_default(),
         );
-        let oauth = OAuth::new(GoClients::new(Default::default()).get(&proxy));
+        let oauth = OAuth::new(
+            GoClients::new(Default::default())
+                .get_checked(&proxy)
+                .map_err(|error| String::from_utf8_lossy(&error.body).into_owned())?,
+        );
         let (file_name, metadata) = complete(&oauth, &callback.code, &redirect, Utc::now())
             .await
             .map_err(|e| e.message)?;

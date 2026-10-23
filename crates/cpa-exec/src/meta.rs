@@ -125,7 +125,7 @@ impl MetaExecutor {
                 "meta executor: missing API key or DCA token",
             ));
         };
-        let mut auth = MetaAuth::new(self.clients.get(&Proxy::effective(credential, cfg)));
+        let mut auth = MetaAuth::new(self.clients.get_checked(&Proxy::effective(credential, cfg))?);
         if let Some(url) = &self.mint_url {
             auth = auth.with_mint_url(url);
         }
@@ -210,7 +210,7 @@ impl MetaExecutor {
             ));
         }
         let url = format!("{}/responses", base.strip_suffix('/').unwrap_or(&base));
-        let client = self.clients.get(&Proxy::effective(&enriched, cfg));
+        let client = self.clients.get_checked(&Proxy::effective(&enriched, cfg))?;
         let body = Bytes::from(prepared.body);
         // Go: TrackHTTPClient for Execute; ExecuteStream uses TrackHTTPClientRoundTripOnly,
         // so its first body byte only records the first-packet fallback.

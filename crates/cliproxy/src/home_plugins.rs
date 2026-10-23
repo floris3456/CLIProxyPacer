@@ -21,8 +21,11 @@ const BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(30);
 /// The store's HTTP clients, one per proxy (Go builds an `http.Client` per sync).
 static CLIENTS: LazyLock<GoClients> = LazyLock::new(|| GoClients::new(Default::default()));
 
-fn doer(cfg: &SyncConfig) -> Arc<dyn Doer> {
-    Arc::new(store::WreqDoer::new(CLIENTS.get(&Proxy::parse(&cfg.proxy_url))))
+fn doer(cfg: &SyncConfig) -> Result<Arc<dyn Doer>, String> {
+    let client = CLIENTS
+        .get_checked(&Proxy::parse(&cfg.proxy_url))
+        .map_err(|_| "plugin store: invalid proxy transport".to_owned())?;
+    Ok(Arc::new(store::WreqDoer::new(client)))
 }
 
 /// The plugin config Home sent: `cfg` as the node runs it, with the `plugins.store-auth`
@@ -96,6 +99,10 @@ async fn sync_plugins(
         Ok(installed) => installed,
         Err(e) => return (homeplugins::completed_sync_report(&platform, Some(&e)), false, Some(e)),
     };
+    let http = match doer(cfg) {
+        Ok(http) => http,
+        Err(e) => return (homeplugins::completed_sync_report(&platform, Some(&e)), false, Some(e)),
+    };
     let request = PluginSyncRequest {
         schema_version: store::PLUGIN_SYNC_SCHEMA_VERSION,
         goos: platform.goos.clone(),
@@ -109,14 +116,14 @@ async fn sync_plugins(
                 response.items,
                 response.expires_at,
                 &request.installed_versions,
-                &doer(cfg),
+                &http,
                 runtime,
             )
             .await;
             (report, true, error)
         }
         Err(cpa_home::Error::PluginSyncUnsupported(_)) => {
-            let (report, error) = homeplugins::sync_with_report(cfg, &doer(cfg), runtime).await;
+            let (report, error) = homeplugins::sync_with_report(cfg, &http, runtime).await;
             (report, true, error)
         }
         Err(e) => {

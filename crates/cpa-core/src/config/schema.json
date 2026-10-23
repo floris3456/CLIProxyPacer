@@ -558,7 +558,11 @@
                 "timezone": "string",
                 "stabilize-device-profile": {
                   "optional": "bool"
-                }
+                },
+                "anthropic-beta-strip": { "list": "string" },
+                "anthropic-beta-append": { "list": "string" },
+                "inject-diagnostics": { "optional": "bool" },
+                "client-request-id": "string"
               }
             },
             "disable-cloaking-model-list": "bool"

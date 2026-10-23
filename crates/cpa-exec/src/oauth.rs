@@ -94,6 +94,7 @@ impl OAuth {
     }
 
     fn client(&self) -> Result<wreq::Client, ExecError> {
+        self.proxy.validate()?;
         match &self.source {
             Source::Fixed(client) => Ok(client.clone()),
             Source::Transport(t) => t
@@ -364,12 +365,13 @@ impl OAuth {
         self.via(proxy).refresh(token).await
     }
 
-    /// One preparation under the runtime's readiness contract. A credential missing its
-    /// identity gets only that (`PrepareRequestAuth`: device pool and account UUID), so
-    /// a failing refresh never blocks requests. Anything else is a token refresh
-    /// (`Refresh`): inside the refresh lead from the background loop, or on demand after
-    /// an upstream 401 (`refreshAuthForRequest`), when nothing else is due.
+    /// Refresh an expired token before identity lookups. Return the rotation for the
+    /// runtime to commit before a separate identity preparation, so profile failure
+    /// cannot discard a spent refresh token. Valid tokens retain identity-first preparation.
     pub(crate) async fn prepare(&self, credential: &Credential, proxy: &Proxy) -> Result<MetadataPatch, ExecError> {
+        if crate::access_token_expired(credential, Utc::now()) && !refresh_token(credential).is_empty() {
+            return self.refresh_credential(credential, proxy).await;
+        }
         if needs_identity(credential) {
             self.via(proxy).prepare_inner(credential).await
         } else {

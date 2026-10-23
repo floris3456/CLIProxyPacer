@@ -21,8 +21,8 @@ impl Clients {
         Self(GoClients::with_default(default))
     }
 
-    pub(crate) fn for_credential(&self, credential: &Credential, cfg: &Config) -> wreq::Client {
-        self.0.get(&Proxy::effective(credential, cfg))
+    pub(crate) fn for_credential(&self, credential: &Credential, cfg: &Config) -> Result<wreq::Client, ExecError> {
+        self.0.get_checked(&Proxy::effective(credential, cfg))
     }
 }
 

@@ -2230,6 +2230,7 @@ async fn attempt(
             && !refreshed
             && !lease.is_remote()
             && classify::is_unauthorized(error)
+            && !policy.error_action(&lease.credential, error).matched
             && let Some(current) = rt.refresh_after_unauthorized(&lease.credential, cfg).await
         {
             refreshed = true;

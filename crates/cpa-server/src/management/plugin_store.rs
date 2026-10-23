@@ -102,10 +102,20 @@ fn sources(state: &Management, configured: &[String]) -> Res<Vec<Source>> {
 }
 
 /// Go `newPluginStoreClient`.
-fn new_client(state: &Management, proxy_url: &str, registry_url: &str, auth: &[AuthConfig]) -> Client {
+fn new_client(
+    state: &Management,
+    proxy_url: &str,
+    registry_url: &str,
+    auth: &[AuthConfig],
+) -> Result<Client, StoreError> {
     let http: Arc<dyn Doer> = match &state.plugin_store.http {
         Some(http) => http.clone(),
-        None => Arc::new(store::WreqDoer::new(state.clients.get(&Proxy::parse(proxy_url)))),
+        None => Arc::new(store::WreqDoer::new(
+            state
+                .clients
+                .get_checked(&Proxy::parse(proxy_url))
+                .map_err(|_| StoreError::Other("invalid proxy transport".to_owned()))?,
+        )),
     };
     let mut client = Client::new(http);
     client.network_scope = proxy_url.trim().to_owned();
@@ -115,7 +125,7 @@ fn new_client(state: &Management, proxy_url: &str, registry_url: &str, auth: &[A
         url => url.to_owned(),
     };
     client.auth = auth.to_vec();
-    client
+    Ok(client)
 }
 
 struct SourceError {
@@ -132,8 +142,11 @@ async fn fetch_sourced_plugins(
     let mut plugins = Vec::new();
     let mut errors = Vec::new();
     for source in sources {
-        let client = new_client(state, &snap.proxy_url, &source.url, &snap.auth);
-        match client.fetch_registry().await {
+        let registry = match new_client(state, &snap.proxy_url, &source.url, &snap.auth) {
+            Ok(client) => client.fetch_registry().await,
+            Err(error) => Err(error),
+        };
+        match registry {
             Ok(registry) => plugins.extend(registry.plugins.into_iter().map(|p| (source.clone(), p))),
             Err(cause) => errors.push(SourceError {
                 source: source.clone(),
@@ -478,7 +491,13 @@ async fn list_inner(state: &Management) -> Res<Response> {
             (status.installed && allows_update).then(|| plugin.clone())
         })
         .collect();
-    let client = new_client(state, &snap.proxy_url, "", &snap.auth);
+    let client = new_client(state, &snap.proxy_url, "", &snap.auth).map_err(|e| {
+        Box::new(error(
+            StatusCode::BAD_GATEWAY,
+            "plugin_store_proxy_failed",
+            &e.to_string(),
+        ))
+    })?;
     let latest = state.plugin_store.releases.latest_all(&client, &latest_input).await;
 
     let mut entries = Vec::with_capacity(plugins.len());
@@ -650,7 +669,13 @@ async fn install_target(
                 "plugin store source not found",
             )));
         };
-        let client = new_client(state, &snap.proxy_url, &source.url, &snap.auth);
+        let client = new_client(state, &snap.proxy_url, &source.url, &snap.auth).map_err(|e| {
+            Box::new(error(
+                StatusCode::BAD_GATEWAY,
+                "plugin_store_proxy_failed",
+                &e.to_string(),
+            ))
+        })?;
         let registry = match client.fetch_registry().await {
             Ok(r) => r,
             Err(e) => {
@@ -699,7 +724,13 @@ async fn install_target(
         )));
     }
     let (source, plugin) = matches.remove(0);
-    let client = new_client(state, &snap.proxy_url, &source.url, &snap.auth);
+    let client = new_client(state, &snap.proxy_url, &source.url, &snap.auth).map_err(|e| {
+        Box::new(error(
+            StatusCode::BAD_GATEWAY,
+            "plugin_store_proxy_failed",
+            &e.to_string(),
+        ))
+    })?;
     Ok((source, plugin, client))
 }
 

@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 use crate::proxy::{self, GoClients, GoHeaders, Hooks, Proxy};
 
 /// `antigravityFallbackVersion`.
-pub const FALLBACK_VERSION: &str = "2.9.1";
-const HUB_PLATFORM: &str = "darwin/arm64";
+pub const FALLBACK_VERSION: &str = "2.24.0";
+const HUB_PLATFORM: &str = "os_type=darwin; arch=arm64";
 const CACHE_TTL: Duration = Duration::from_secs(6 * 3600);
 const FETCH_TIMEOUT: Duration = Duration::from_secs(10);
 /// `AntigravityNodeAPIClientUA`.
@@ -112,7 +112,15 @@ pub fn latest_version() -> String {
 
 /// `AntigravityUserAgent`.
 pub fn user_agent() -> String {
-    format!("antigravity/hub/{} {HUB_PLATFORM}", latest_version())
+    let version = latest_version();
+    // Release-specific build metadata from internal/misc/antigravity_version.go.
+    // Unknown manifest versions must not claim a different release's changelist.
+    let changelist = match version.as_str() {
+        "2.23.0" => "; cl=998057262",
+        "2.24.0" => "; cl=1000335682",
+        _ => "",
+    };
+    format!("antigravity/hub/{version} (aidev_client; {HUB_PLATFORM}{changelist})")
 }
 
 fn antigravity_family(lower: &str) -> bool {

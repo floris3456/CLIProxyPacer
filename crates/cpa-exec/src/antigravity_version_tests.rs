@@ -36,7 +36,7 @@ fn latest_version_falls_back_until_fetched() {
 #[test]
 fn fallback_meets_backend_floor() {
     let parts: Vec<u32> = FALLBACK_VERSION.split('.').map(|p| p.parse().unwrap()).collect();
-    assert!(parts[0] > 2 || (parts[0] == 2 && parts[1] >= 9), "{FALLBACK_VERSION}");
+    assert!(parts[0] > 2 || (parts[0] == 2 && parts[1] >= 23), "{FALLBACK_VERSION}");
 }
 
 /// Values Go computed with its never-refreshed cache (tests/reference/antigravity).
@@ -46,47 +46,77 @@ fn user_agents_match_go() {
         serde_json::from_str(include_str!("../tests/fixtures/antigravity_go.json")).unwrap();
     let go = &fixture["user_agents"];
     with_cached(FALLBACK_VERSION, None, || {
-        assert_eq!(latest_version(), go["latest"].as_str().unwrap());
-        assert_eq!(user_agent(), go["user_agent"].as_str().unwrap());
+        // The immutable capture predates Hub's version floor and structured build
+        // metadata. Only its generated default changes; configured identities keep
+        // the recorded semantics. The exact current identity is checked below.
+        let recorded_version = go["latest"].as_str().unwrap();
+        let recorded_default = go["user_agent"].as_str().unwrap();
+        assert_eq!(recorded_version, "2.9.1");
+        assert_eq!(recorded_default, "antigravity/hub/2.9.1 darwin/arm64");
+        let current_default = user_agent();
+        let expected = |value: &serde_json::Value| value.as_str().unwrap().replace(recorded_default, &current_default);
         let cases = go["cases"].as_array().unwrap();
         assert!(cases.len() >= 12);
         for case in cases {
             let input = case["in"].as_str().unwrap();
             assert_eq!(
                 request_user_agent(input),
-                case["request"].as_str().unwrap(),
+                expected(&case["request"]),
                 "request {input:?}"
             );
             assert_eq!(
                 load_code_assist_user_agent(input),
-                case["load_code_assist"].as_str().unwrap(),
+                expected(&case["load_code_assist"]),
                 "load {input:?}"
             );
             assert_eq!(
                 onboard_user_user_agent(input),
-                case["onboard_user"].as_str().unwrap(),
+                expected(&case["onboard_user"]),
                 "onboard {input:?}"
             );
-            assert_eq!(
-                version_from_user_agent(input),
-                case["version"].as_str().unwrap(),
-                "version {input:?}"
-            );
+            let version = case["version"].as_str().unwrap();
+            let version = if version == recorded_version {
+                FALLBACK_VERSION
+            } else {
+                version
+            };
+            assert_eq!(version_from_user_agent(input), version, "version {input:?}");
         }
     });
 }
 
-/// internal/misc/antigravity_version_test.go with a fetched 2.2.1.
 #[test]
-fn user_agents_follow_the_fetched_version() {
-    with_cached("2.2.1", fresh(), || {
-        assert_eq!(user_agent(), "antigravity/hub/2.2.1 darwin/arm64");
-        assert_eq!(load_code_assist_user_agent(""), "antigravity/hub/2.2.1 darwin/arm64");
+fn default_identity_uses_matching_version_and_changelist() {
+    with_cached("", None, || {
+        let expected = "antigravity/hub/2.24.0 (aidev_client; os_type=darwin; arch=arm64; cl=1000335682)";
+        assert_eq!(latest_version(), "2.24.0");
+        assert_eq!(user_agent(), expected);
+        assert_eq!(request_user_agent(""), expected);
+        assert_eq!(load_code_assist_user_agent(""), expected);
+        let onboard = onboard_user_user_agent("");
+        assert_eq!(onboard, format!("{expected} google-api-nodejs-client/10.3.0"));
+        assert_eq!(version_from_user_agent(&onboard), "2.24.0");
+    });
+    with_cached("2.23.0", fresh(), || {
+        assert_eq!(
+            user_agent(),
+            "antigravity/hub/2.23.0 (aidev_client; os_type=darwin; arch=arm64; cl=998057262)"
+        );
+    });
+}
+
+#[test]
+fn fetched_version_never_borrows_another_releases_changelist() {
+    with_cached("2.25.0", fresh(), || {
+        let expected = "antigravity/hub/2.25.0 (aidev_client; os_type=darwin; arch=arm64)";
+        assert_eq!(user_agent(), expected);
+        assert_eq!(request_user_agent(""), expected);
+        assert_eq!(load_code_assist_user_agent(""), expected);
         assert_eq!(
             onboard_user_user_agent(""),
-            "antigravity/hub/2.2.1 darwin/arm64 google-api-nodejs-client/10.3.0"
+            format!("{expected} google-api-nodejs-client/10.3.0")
         );
-        assert_eq!(version_from_user_agent("curl/8"), "2.2.1");
+        assert_eq!(version_from_user_agent("curl/8"), "2.25.0");
         // Non-ASCII before the suffix must not break the cut.
         assert_eq!(
             request_user_agent("antigravity/İ google-api-nodejs-client/1"),

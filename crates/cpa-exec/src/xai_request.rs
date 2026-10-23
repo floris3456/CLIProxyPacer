@@ -9,6 +9,7 @@ use cpa_common::gostr::GoStr;
 use cpa_common::json::{self as gj, GoValue, Kind, Res};
 use cpa_common::thinking::{self, ModelCaps, RequestThinking, parse_suffix};
 use cpa_core::config::Config;
+use cpa_core::credential::Credential;
 use cpa_core::exec::{ExecError, ExecRequest, FailureScope};
 use cpa_core::format::Format;
 use cpa_translate::RequestCtx;
@@ -150,6 +151,7 @@ fn preserve_output_controls(mut body: Vec<u8>, source: &[u8], from: Format) -> V
 
 /// `prepareResponsesRequestTo`.
 pub(crate) async fn prepare(
+    credential: &Credential,
     req: &ExecRequest,
     cfg: &Config,
     stream: bool,
@@ -221,7 +223,7 @@ pub(crate) async fn prepare(
         body = ensure_native_x_search_tool(body);
     }
     body = clamp_tools_limit(body, MAX_TOOLS, &namespace_tools);
-    let replay_scope = replay::scope(req, &body, downstream_websocket);
+    let replay_scope = replay::scope(credential, req, &body, downstream_websocket);
     body = replay::apply(replay_store, &replay_scope, body).await;
     body = normalize_input_custom_tool_calls(body);
     body = normalize_input_namespace_tool_calls(body, fold);

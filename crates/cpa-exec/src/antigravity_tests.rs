@@ -102,7 +102,8 @@ fn request(s: &Value) -> ExecRequest {
 }
 
 /// Values Go draws from the clock or a random source, reduced to their shape. The
-/// default user agent's version is the process-wide cache the version tests change.
+/// The immutable capture uses the older default Hub identity. Normalize its explicit
+/// format change here; antigravity_version_tests checks the current wire value exactly.
 fn normalize(text: &str) -> String {
     static RULES: std::sync::OnceLock<Vec<(regex::Regex, &'static str)>> = std::sync::OnceLock::new();
     let rules = RULES.get_or_init(|| {
@@ -128,8 +129,8 @@ fn normalize(text: &str) -> String {
             // OpenAI chat tool-call IDs: `<name>-<UnixNano>-<n>`.
             (r#""id": ?"([^"]+)-1[0-9]{18}-([0-9]+)""#, r#""id":"$1-<nano>-$2""#),
             (
-                r"antigravity/hub/[0-9.]+ darwin/arm64",
-                "antigravity/hub/<v> darwin/arm64",
+                r"antigravity/hub/[0-9.]+ (darwin/arm64|\(aidev_client; os_type=darwin; arch=arm64(; cl=[0-9]+)?\))",
+                "antigravity/hub/<current-default>",
             ),
             (
                 r"short cooldown, [0-9.]+(ms|s) remaining",
@@ -254,6 +255,25 @@ async fn a_split_payload_reports_its_served_model() {
 /// Replays `scenarios` in order on one executor; returns how many ran.
 async fn replay_go_scenarios(scenarios: &[Value]) -> usize {
     let executor = AntigravityExecutor::default();
+    // Each recorded turn used a new mock port and auth ID. Replay now belongs to a
+    // selected account and endpoint, so the positive replay sequences must retain
+    // both. Forward bytes to each one-shot mock without changing the wire fixture.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let replay_addr = listener.local_addr().unwrap().to_string();
+    let destination = Arc::new(std::sync::Mutex::new(String::new()));
+    let forwarding = tokio::spawn({
+        let destination = destination.clone();
+        async move {
+            while let Ok((mut client, _)) = listener.accept().await {
+                let target = destination.lock().unwrap().clone();
+                tokio::spawn(async move {
+                    if let Ok(mut upstream) = tokio::net::TcpStream::connect(&target).await {
+                        let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream).await;
+                    }
+                });
+            }
+        }
+    });
     let mut ran = 0;
     for s in scenarios {
         let name = s["name"].as_str().unwrap();
@@ -261,9 +281,20 @@ async fn replay_go_scenarios(scenarios: &[Value]) -> usize {
             continue;
         }
         let mock = Mock::start(&s["upstream"]).await;
-        let addr = mock.addr().to_owned();
+        let replay_family = name.split_once("_turn").map(|(family, _)| family).filter(|family| {
+            family.starts_with("replay_") || (*family == "caqs" && s["headers"]["X-Claude-Code-Session-Id"].is_string())
+        });
+        let addr = if replay_family.is_some() {
+            *destination.lock().unwrap() = mock.addr().to_owned();
+            replay_addr.clone()
+        } else {
+            mock.addr().to_owned()
+        };
         let cfg = Config::parse(s["config"].as_str().unwrap_or_default()).unwrap();
         let mut cred = credential(s, &addr);
+        if let Some(family) = replay_family {
+            cred.id = format!("fixture-{family}");
+        }
         if s["known_credits"] == true {
             credits::set_hint(
                 &cred.id,
@@ -351,7 +382,7 @@ async fn replay_go_scenarios(scenarios: &[Value]) -> usize {
         ] {
             check_capsules(name, text.unwrap_or_default(), &summary);
         }
-        let wire = mock.request();
+        let wire = mock.request().map(|wire| wire.replace(&addr, "UPSTREAM"));
         assert_same(
             name,
             "upstream request",
@@ -429,6 +460,7 @@ async fn replay_go_scenarios(scenarios: &[Value]) -> usize {
         assert!(events.is_empty(), "{name}: extra captures {events:?}");
         ran += 1;
     }
+    forwarding.abort();
     ran
 }
 

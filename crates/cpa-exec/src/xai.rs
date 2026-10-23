@@ -432,7 +432,7 @@ impl XaiExecutor {
 
     /// `XAIExecutor.Refresh` through the credential's proxy.
     pub async fn prepare(&self, credential: &Credential, cfg: &Config) -> Result<MetadataPatch, ExecError> {
-        let auth = xai_auth::XaiAuth::new(self.clients.for_credential(credential, cfg));
+        let auth = xai_auth::XaiAuth::new(self.clients.for_credential(credential, cfg)?);
         xai_auth::refresh(&auth, credential).await
     }
 
@@ -448,7 +448,7 @@ impl XaiExecutor {
         let cfg = scoped(credential, cfg);
         let cfg = cfg.as_ref();
         if req.operation == Operation::CountTokens {
-            return self.count_tokens(&req, cfg).await;
+            return self.count_tokens(credential, &req, cfg).await;
         }
         if req.alt.as_deref() == Some(COMPACT_ALT) {
             if req.stream {
@@ -477,14 +477,23 @@ impl XaiExecutor {
         let base = chat_base_url(credential);
         let mut prepared = before_reporter(
             &req.usage,
-            request::prepare(&req, cfg, true, Format::Codex, &self.replay, downstream_websocket).await,
+            request::prepare(
+                credential,
+                &req,
+                cfg,
+                true,
+                Format::Codex,
+                &self.replay,
+                downstream_websocket,
+            )
+            .await,
         )?;
         // Execute and ExecuteStream publish only usage they parsed (no EnsurePublished).
         req.usage.usage_required();
         req.usage.request_for(PROVIDER, &prepared.body);
         prepared.finalize_body(cfg, &req);
         let headers = chat_headers(credential, &token, true, &prepared.session_id, &req);
-        let client = self.clients.for_credential(credential, cfg);
+        let client = self.clients.for_credential(credential, cfg)?;
         let url = self.url(endpoint(&base, "/responses"));
         let capture = capture_request(&req, credential, "POST", &url, &headers, &prepared.body);
         req.usage.round_trip_started();
@@ -530,6 +539,7 @@ impl XaiExecutor {
         let mut p = before_reporter(
             &req.usage,
             request::prepare(
+                credential,
                 req,
                 cfg,
                 false,
@@ -554,7 +564,7 @@ impl XaiExecutor {
         req.usage.request_for(PROVIDER, &body);
         p.body = p.finalize(cfg, req, body);
         let headers = plain_headers(credential, &token, false, &p.session_id, req);
-        let client = self.clients.for_credential(credential, cfg);
+        let client = self.clients.for_credential(credential, cfg)?;
         let url = self.url(endpoint(&base, "/responses/compact"));
         let capture = capture_request(req, credential, "POST", &url, &headers, &p.body);
         req.usage.round_trip_started();
@@ -630,8 +640,13 @@ impl XaiExecutor {
     }
 
     /// CountTokens: O200kBase estimate of the prepared body, no upstream call.
-    async fn count_tokens(&self, req: &ExecRequest, cfg: &Config) -> Result<ExecResponse, ExecError> {
-        let mut p = request::prepare(req, cfg, false, Format::Codex, &self.replay, false).await?;
+    async fn count_tokens(
+        &self,
+        credential: &Credential,
+        req: &ExecRequest,
+        cfg: &Config,
+    ) -> Result<ExecResponse, ExecError> {
+        let mut p = request::prepare(credential, req, cfg, false, Format::Codex, &self.replay, false).await?;
         p.finalize_body(cfg, req);
         let count = count_input_tokens(&p.body).map_err(|e| {
             ExecError::local(
@@ -768,7 +783,7 @@ impl XaiExecutor {
         body: Option<Vec<u8>>,
         logged: &[u8],
     ) -> Result<(u16, HeaderMap, Bytes), ExecError> {
-        let client = self.clients.for_credential(credential, cfg);
+        let client = self.clients.for_credential(credential, cfg)?;
         let route = |_: &url::Url| {
             Ok(crate::proxy::Route {
                 client: client.clone(),

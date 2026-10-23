@@ -344,7 +344,7 @@ impl DevinExecutor {
         if token.is_empty() {
             return Ok(MetadataPatch::default());
         }
-        let client = self.clients.get(&Proxy::effective(credential, cfg));
+        let client = self.clients.get_checked(&Proxy::effective(credential, cfg))?;
         let auth = DevinAuth::new(client).with_devin_transport();
         let auth = if base.is_empty() {
             auth
@@ -508,7 +508,7 @@ impl DevinExecutor {
         if !prepared.model_uid.is_empty() {
             req.usage.upstream_model(&prepared.model_uid);
         }
-        let client = self.clients.get(&Proxy::effective(credential, cfg));
+        let client = self.clients.get_checked(&Proxy::effective(credential, cfg))?;
         let capture = req.capture().clone();
         capture_request(
             &capture,

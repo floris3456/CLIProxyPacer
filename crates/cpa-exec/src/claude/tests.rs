@@ -2337,3 +2337,289 @@ async fn responses_compaction_matches_go() {
     }
     reply.lock().unwrap().clear();
 }
+
+fn safety_config(yaml: &str) -> Config {
+    // Preparation does not load credentials or send requests; keep even its unused
+    // auth directory private so a future refactor cannot discover real logins.
+    let auth_dir = std::env::temp_dir().join(format!("claude-safety-{}", uuid::Uuid::new_v4()));
+    Config::parse(&format!(
+        "config-version: 8\noauth:\n  auth-dir: {}\n{yaml}",
+        serde_json::to_string(&auth_dir.to_string_lossy()).unwrap()
+    ))
+    .unwrap()
+}
+
+async fn safety_prepare(credential: &Credential, cfg: &Config, req: &ExecRequest) -> Prepared {
+    let executor = ClaudeExecutor::with_client(wreq::Client::new(), DEFAULT_BASE_URL);
+    let ctx = Ctx::new(&executor, credential, req, cfg, Default::default());
+    let translated = translate::request(req, ctx.codex, &ctx.base_model, ctx.is_compat).unwrap();
+    if req.operation == Operation::CountTokens {
+        let original = translate::count_original(req, &translated, ctx.codex, &ctx.base_model, ctx.is_compat).unwrap();
+        ctx.prepare_count(req, &translated, &original).await.unwrap()
+    } else {
+        let original = translate::original(req, &translated, ctx.codex, &ctx.base_model, ctx.is_compat).unwrap();
+        ctx.prepare_messages(req, &translated, &original, req.stream)
+            .await
+            .unwrap()
+    }
+}
+
+fn sent_header<'a>(prepared: &'a Prepared, name: &str) -> &'a str {
+    prepared
+        .headers
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(name))
+        .map(|(_, value)| value.as_str())
+        .unwrap_or("")
+}
+
+fn safety_request(stream: bool) -> ExecRequest {
+    client_request(
+        format!(
+            r#"{{"model":"claude-sonnet-4-6","max_tokens":128,"stream":{stream},"messages":[{{"role":"user","content":"Explain the implementation and its tradeoffs."}}]}}"#
+        ),
+        Default::default(),
+    )
+}
+
+#[tokio::test]
+async fn provider_safety_header_controls_apply_to_final_messages_and_count() {
+    let cfg = safety_config(
+        "upstream:\n  claude:\n    header-defaults:\n      anthropic-beta-strip: [claude-code-20250219, remove-me]\n      anthropic-beta-append: [keep-last, keep-last, added-last]\n      inject-diagnostics: false\n      client-request-id: off\n",
+    );
+    let mut credential = harness_credential();
+    credential
+        .attributes
+        .insert("header:X-Client-Request-Id".into(), "custom-id".into());
+    credential
+        .attributes
+        .insert("header:Anthropic-Beta".into(), "remove-me,keep-first".into());
+    for first_party in [true, false] {
+        if !first_party {
+            credential
+                .attributes
+                .insert("base_url".into(), "https://gateway.invalid".into());
+        }
+        for (stream, count) in [(false, false), (true, false), (false, true)] {
+            let mut req = safety_request(stream);
+            if count {
+                req.operation = Operation::CountTokens;
+            }
+            let prepared = safety_prepare(&credential, &cfg, &req).await;
+            assert!(sent_header(&prepared, "x-client-request-id").is_empty());
+            let betas = sent_header(&prepared, "anthropic-beta");
+            assert!(
+                !betas
+                    .split(',')
+                    .any(|beta| beta == betas::CLAUDE_CODE || beta == "remove-me")
+            );
+            assert!(betas.ends_with("keep-last,added-last"), "{betas}");
+            assert_eq!(betas.split(',').filter(|beta| *beta == "keep-last").count(), 1);
+            assert!(!rawjson::get(&prepared.body, "diagnostics").exists());
+            if first_party {
+                assert!(!betas.split(',').any(|beta| beta == betas::CACHE_DIAGNOSIS));
+            }
+        }
+    }
+    // Disabling injection leaves caller-owned diagnostics intact.
+    credential.attributes.remove("base_url");
+    let body = rawjson::set_raw(
+        &utf8(&safety_request(false).body),
+        "diagnostics",
+        r#"{"caller":"keep"}"#,
+    );
+    let prepared = safety_prepare(&credential, &cfg, &client_request(body, Default::default())).await;
+    assert_eq!(
+        rawjson::get(&prepared.body, "diagnostics").json(),
+        r#"{"caller":"keep"}"#
+    );
+}
+
+#[tokio::test]
+async fn provider_safety_request_id_modes_never_restore_disabled_or_synthetic_ids() {
+    let mut credential = harness_credential();
+    for mode in ["on", "off", "passthrough"] {
+        let cfg = safety_config(&format!(
+            "upstream: {{claude: {{header-defaults: {{client-request-id: {mode}}}}}}}\n"
+        ));
+        for incoming in [None, Some("caller-request-id")] {
+            for custom in [false, true] {
+                if custom {
+                    credential
+                        .attributes
+                        .insert("header:X-Client-Request-Id".into(), "custom-id".into());
+                } else {
+                    credential.attributes.remove("header:X-Client-Request-Id");
+                }
+                let mut req = safety_request(false);
+                if let Some(id) = incoming {
+                    req.headers.insert("x-client-request-id", id.parse().unwrap());
+                }
+                let prepared = safety_prepare(&credential, &cfg, &req).await;
+                let sent = sent_header(&prepared, "x-client-request-id");
+                match mode {
+                    "off" => assert!(sent.is_empty()),
+                    "passthrough" => assert_eq!(sent, incoming.unwrap_or_default()),
+                    _ if custom => assert_eq!(sent, "custom-id"),
+                    _ => assert!(uuid::Uuid::parse_str(sent).is_ok()),
+                }
+            }
+        }
+    }
+}
+
+fn safety_native_request() -> ExecRequest {
+    let session = "11111111-2222-4333-8444-555555555555";
+    let user_id =
+        serde_json::json!({"device_id": "a".repeat(64), "account_uuid": "", "session_id": session}).to_string();
+    let body = serde_json::json!({
+        "model": "claude-sonnet-4-6", "max_tokens": 128,
+        "system": [
+            {"type":"text","text":"x-anthropic-billing-header: cc_version=2.1.280.000; cc_entrypoint=cli;"},
+            {"type":"text","text":cloak::CLI_IDENTITY},
+            {"type":"text","text":"Keep this application prompt.","cache_control":{"type":"ephemeral"}}
+        ],
+        "metadata":{"user_id":user_id,"tag":"keep"},
+        "diagnostics":{"previous_message_id":"msg_native"},
+        "messages":[{"role":"user","content":"Explain this request."}]
+    })
+    .to_string();
+    let headers = [
+        ("user-agent", profile::BASELINE.user_agent),
+        ("x-app", "cli"),
+        (
+            "anthropic-beta",
+            "claude-code-20250219,oauth-2025-04-20,redact-thinking-2026-02-12,cache-diagnosis-2026-04-07",
+        ),
+        ("x-claude-code-session-id", session),
+        ("x-client-request-id", "native-id"),
+        ("x-stainless-runtime", "node"),
+    ]
+    .into_iter()
+    .map(|(name, value)| (name.parse().unwrap(), value.parse().unwrap()))
+    .collect();
+    client_request(body, headers)
+}
+
+#[tokio::test]
+async fn provider_safety_uncloak_preserves_application_data_and_oauth_identity() {
+    let req = safety_native_request();
+    let application_prompt = rawjson::get(&utf8(&req.body), "system.2").json().to_owned();
+    for mode in ["never", "uncloak"] {
+        let cfg = safety_config(&format!(
+            "api-keys:\n  claude:\n    - keys:\n        - api-key: local-test-key\n          cloak: {{mode: {mode}}}\n"
+        ));
+        let mut credential = harness_credential();
+        credential.attributes.insert("api_key".into(), "local-test-key".into());
+        let prepared = safety_prepare(&credential, &cfg, &req).await;
+        assert_eq!(rawjson::get(&prepared.body, "system").array().len(), 1);
+        assert_eq!(rawjson::get(&prepared.body, "system.0").json(), application_prompt);
+        assert!(!rawjson::get(&prepared.body, "metadata.user_id").exists());
+        assert_eq!(rawjson::string(&prepared.body, "metadata.tag"), "keep");
+        assert!(!rawjson::get(&prepared.body, "diagnostics").exists());
+        assert!(sent_header(&prepared, "user-agent").starts_with("CLIProxyAPI/"));
+        for name in [
+            "x-app",
+            "x-client-request-id",
+            "x-stainless-runtime",
+            "x-claude-code-session-id",
+        ] {
+            assert!(sent_header(&prepared, name).is_empty(), "{mode}: {name}");
+        }
+        assert!(sent_header(&prepared, "anthropic-beta").is_empty());
+        assert_eq!(sent_header(&prepared, "x-api-key"), "local-test-key");
+
+        let mut oauth = harness_credential();
+        oauth.attributes.insert("cloak_mode".into(), mode.into());
+        let prepared = safety_prepare(&oauth, &cfg, &req).await;
+        assert!(detect::valid_user_id(&rawjson::string(
+            &prepared.body,
+            "metadata.user_id"
+        )));
+        assert_eq!(sent_header(&prepared, "x-app"), "cli");
+        assert!(sent_header(&prepared, "authorization").starts_with("Bearer sk-ant-oat"));
+    }
+    // A generic application identity and diagnostics are not native attribution.
+    let body = r#"{"system":"Application instructions.","metadata":{"user_id":"application-user"},"diagnostics":{"application":true}}"#;
+    assert_eq!(uncloak_payload(body, false), body);
+}
+
+#[tokio::test]
+async fn provider_safety_payload_rules_keep_final_authority_over_identity() {
+    for stream in [false, true] {
+        let credential = harness_credential();
+        let req = safety_request(stream);
+        let cfg = safety_config(
+            "requests:\n  payload:\n    filter:\n      - models: [{name: claude-sonnet-4-6}]\n        params: [metadata.user_id, diagnostics, system]\n",
+        );
+        let prepared = safety_prepare(&credential, &cfg, &req).await;
+        for path in ["metadata.user_id", "diagnostics", "system"] {
+            assert!(!rawjson::get(&prepared.body, path).exists(), "{path} resurrected");
+        }
+        assert!(!prepared.continuity.initialized);
+        let cfg = safety_config(
+            "requests:\n  payload:\n    override:\n      - models: [{name: claude-sonnet-4-6}]\n        params: {metadata.user_id: operator-choice}\n",
+        );
+        let prepared = safety_prepare(&credential, &cfg, &req).await;
+        assert_eq!(rawjson::string(&prepared.body, "metadata.user_id"), "operator-choice");
+    }
+}
+
+pub(super) fn safety_haiku55_request(entrypoint: &str) -> ExecRequest {
+    let native = safety_native_request();
+    let mut body = rawjson::set_str(&utf8(&native.body), "model", "claude-haiku-5-5");
+    body = rawjson::set_str(
+        &body,
+        "system.0.text",
+        &format!("x-anthropic-billing-header: cc_version=2.1.280.000; cc_entrypoint={entrypoint}; cch=123ab;"),
+    );
+    body = rawjson::delete(&body, "metadata.tag");
+    body = rawjson::set_raw(&body, "tools", "[]");
+    body = rawjson::set_raw(
+        &body,
+        "output_config",
+        r#"{"format":{"type":"json_schema","schema":{"type":"object","properties":{"title":{"type":"string"}},"required":["title"],"additionalProperties":false}}}"#,
+    );
+    let mut headers = native.headers;
+    headers.insert(
+        "user-agent",
+        format!("claude-cli/2.1.280 (external, {entrypoint})").parse().unwrap(),
+    );
+    // Claude Code pointed at a gateway omits the OAuth beta and request UUID.
+    headers.remove("x-client-request-id");
+    for (name, value) in [
+        (
+            "anthropic-beta",
+            "interleaved-thinking-2025-05-14,thinking-token-count-2026-05-13,context-management-2025-06-27,prompt-caching-scope-2026-01-05",
+        ),
+        ("accept", "application/json"),
+        ("content-type", "application/json"),
+        ("x-stainless-lang", "js"),
+        ("x-stainless-retry-count", "0"),
+        ("x-stainless-timeout", "600"),
+        ("x-stainless-os", "MacOS"),
+        ("x-stainless-arch", "arm64"),
+        ("x-stainless-package-version", "0.120.4"),
+        ("x-stainless-runtime-version", "v27.0.1"),
+        ("anthropic-version", "2023-06-01"),
+        ("anthropic-dangerous-direct-browser-access", "true"),
+        ("accept-encoding", "gzip, deflate, br, zstd"),
+    ] {
+        headers.insert(http::HeaderName::from_static(name), value.parse().unwrap());
+    }
+    client_request(body, headers)
+}
+
+#[tokio::test]
+async fn provider_safety_native_helper_keeps_prompt_and_adds_selected_oauth_beta() {
+    let req = safety_haiku55_request("sdk-ts");
+    let system = rawjson::get(&utf8(&req.body), "system.1").json().to_owned();
+    assert!(detect::detect(&req.headers, &utf8(&req.body), false, &Settings::default()).helper_profile);
+    let prepared = safety_prepare(&harness_credential(), &safety_config(""), &req).await;
+    assert_eq!(rawjson::get(&prepared.body, "system.1").json(), system);
+    assert_eq!(sent_header(&prepared, "x-stainless-package-version"), "0.120.4");
+    assert_eq!(sent_header(&prepared, "x-stainless-runtime-version"), "v27.0.1");
+    let betas = sent_header(&prepared, "anthropic-beta");
+    assert!(betas.split(',').any(|beta| beta == betas::OAUTH));
+    assert!(!betas.split(',').any(|beta| beta == betas::EXTENDED_CACHE_TTL));
+}

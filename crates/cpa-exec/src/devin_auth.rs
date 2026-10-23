@@ -25,7 +25,7 @@ use sha2::{Digest, Sha256};
 
 use crate::devin_wire::{device_fingerprint, pb};
 use crate::meta_auth::{GoMap, go_map_from_json, merge_existing, normalize_metadata};
-use crate::proxy::{GoHeaders, read_all, request};
+use crate::proxy::{GoHeaders, read_all, request, request_once};
 
 /// `DefaultAppBaseURL`.
 pub const DEFAULT_APP_BASE_URL: &str = "https://app.devin.ai";
@@ -394,7 +394,7 @@ impl DevinAuth {
         h.set("Content-Type", "application/json");
         h.set("Accept", "application/json");
         let url = format!("{}/auth/cli/token", self.api_base.trim_end_matches('/'));
-        let upstream = request(
+        let upstream = request_once(
             &self.client,
             wreq::Method::POST,
             &url,
@@ -405,6 +405,9 @@ impl DevinAuth {
         .await
         .map_err(|e| format!("devin token exchange failed: {}", lossy(&e.body)))?;
         let status = upstream.status;
+        if (300..400).contains(&status) {
+            return Err("devin token endpoint redirects are not allowed".into());
+        }
         let data = read_all(upstream.body, BODY_LIMIT, false)
             .await
             .map_err(|e| format!("read token exchange response: {}", lossy(&e.body)))?;
@@ -454,7 +457,7 @@ impl DevinAuth {
         h.set("Accept", "*/*");
         h.set("User-Agent", "");
         let url = format!("{}{USER_STATUS_PATH}", self.server_base.trim_end_matches('/'));
-        let upstream = request(
+        let upstream = request_once(
             &self.client,
             wreq::Method::POST,
             &url,
@@ -464,6 +467,9 @@ impl DevinAuth {
         )
         .await
         .map_err(|e| lossy(&e.body))?;
+        if (300..400).contains(&upstream.status) {
+            return Err("devin account endpoint redirects are not allowed".into());
+        }
         let data = read_all(upstream.body, STATUS_LIMIT, false)
             .await
             .map_err(|e| lossy(&e.body))?;
@@ -990,7 +996,15 @@ pub async fn login(cfg: &cpa_core::config::Config, no_browser: bool, callback_po
         .and_then(|r| r.get("proxy-url"))
         .and_then(|v| v.as_str())
         .unwrap_or_default();
-    let client = crate::proxy::GoClients::new(crate::proxy::Hooks::default()).get(&crate::proxy::Proxy::parse(proxy));
+    let client = match crate::proxy::GoClients::new(crate::proxy::Hooks::default())
+        .get_checked(&crate::proxy::Proxy::parse(proxy))
+    {
+        Ok(client) => client,
+        Err(_) => {
+            tracing::error!("Devin authentication failed: invalid proxy transport");
+            return None;
+        }
+    };
     let auth = DevinAuth::new(client);
     let record = match login_with(&auth, no_browser, callback_port).await {
         Ok(record) => record,

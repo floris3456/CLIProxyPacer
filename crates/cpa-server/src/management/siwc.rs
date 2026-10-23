@@ -432,10 +432,22 @@ pub(super) fn callback(state: &Arc<Management>, req: &CallbackRequest, query: Op
     }
     let (worker, task_flow) = (state.clone(), flow.clone());
     let task = tokio::spawn(async move {
+        let client = match super::oauth::login_client(&worker) {
+            Ok(client) => client,
+            Err(_) => {
+                fail_session(
+                    &worker,
+                    &sid,
+                    &task_flow,
+                    "SIWC token exchange failed: invalid proxy transport",
+                );
+                return;
+            }
+        };
         let oauth = match &worker.login_base {
-            Some(base) => cpa_exec::codex_oauth::CodexOAuth::new(super::oauth::login_client(&worker))
+            Some(base) => cpa_exec::codex_oauth::CodexOAuth::new(client)
                 .with_siwc_token_url(&format!("{base}/api/accounts/oauth/token")),
-            None => cpa_exec::codex_oauth::CodexOAuth::new(super::oauth::login_client(&worker)),
+            None => cpa_exec::codex_oauth::CodexOAuth::new(client),
         };
         let exchange = oauth.exchange_siwc(
             &code,

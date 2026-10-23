@@ -16,7 +16,7 @@ use super::settings::Settings;
 use crate::rawjson;
 
 /// Entrypoints whose wire behaviour was captured and reviewed for passthrough.
-pub(crate) const NATIVE_ENTRYPOINTS: &[&str] = &["cli", "sdk-cli", "claude-vscode"];
+pub(crate) const NATIVE_ENTRYPOINTS: &[&str] = &["cli", "sdk-cli", "sdk-ts", "claude-vscode"];
 pub(crate) const HELPER_MODEL: &str = "claude-haiku-4-5-20251001";
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -171,12 +171,12 @@ pub(crate) fn detect(headers: &HeaderMap, payload: &str, count_tokens: bool, set
     let standard = x_app && ua && betas && (count_tokens || metadata_user_id);
     let helper = native
         && !count_tokens
-        && entrypoint == "cli"
         && !betas
         && x_app
         && ua
         && metadata_user_id
-        && helper_profile(headers, payload, settings);
+        && ((entrypoint == "cli" && helper_profile(headers, payload, settings))
+            || haiku55_helper(headers, payload, &entrypoint, settings));
     Detection {
         confirmed: (standard || helper) && native,
         helper_profile: helper,
@@ -252,10 +252,10 @@ fn helper_profile(headers: &HeaderMap, payload: &str, settings: &Settings) -> bo
     let Some(shape) = measured_beta_shape(&joined_betas(headers)) else {
         return false;
     };
-    body_shape(payload) == Some(shape) && helper_headers(headers, settings) && helper_session(headers, payload)
+    body_shape(payload) == Some(shape) && helper_headers(headers, settings, false) && helper_session(headers, payload)
 }
 
-fn helper_headers(headers: &HeaderMap, settings: &Settings) -> bool {
+fn helper_headers(headers: &HeaderMap, settings: &Settings, haiku55: bool) -> bool {
     let expected = [
         ("accept", "application/json"),
         ("content-type", "application/json"),
@@ -287,14 +287,18 @@ fn helper_headers(headers: &HeaderMap, settings: &Settings) -> bool {
         raw_header(headers, "x-stainless-package-version"),
         raw_header(headers, "x-stainless-runtime-version"),
     );
-    let exact = candidate.0.is_some()
-        && candidate.0 == profile::version(&baseline.user_agent)
-        && candidate.1 == baseline.package_version
-        && candidate.2 == baseline.runtime_version;
-    // A newer release's helper is confirmed with its own versions, as its main requests
-    // are (docs/DIFFERENCES-FROM-GO.md); the measured beta and body shapes still guard.
-    let newer = profile::newer_than_baseline(user_agent, settings) && profile::stainless_versions_ok(headers);
-    if !exact && !newer {
+    let versions_match = if haiku55 {
+        profile::package_version_at_least(candidate.1, &baseline.package_version)
+            && profile::runtime_version_at_least(candidate.2, &baseline.runtime_version)
+    } else {
+        // Older measured helpers retain the baseline tuple or a newer native release.
+        (candidate.0.is_some()
+            && candidate.0 == profile::version(&baseline.user_agent)
+            && candidate.1 == baseline.package_version
+            && candidate.2 == baseline.runtime_version)
+            || (profile::newer_than_baseline(user_agent, settings) && profile::stainless_versions_ok(headers))
+    };
+    if !versions_match {
         return false;
     }
     if !raw_header(headers, "x-stainless-async").is_empty()
@@ -304,6 +308,88 @@ fn helper_headers(headers: &HeaderMap, settings: &Settings) -> bool {
     }
     let request_id = raw_header(headers, "x-client-request-id");
     request_id.is_empty() || uuid::Uuid::parse_str(request_id).is_ok()
+}
+
+/// The measured markerless Haiku 5.5 title/web-search helper. A native-looking
+/// User-Agent alone never grants passthrough: require the SDK envelope, session
+/// binding, billing/identity pair, and one of the two known body shapes.
+fn haiku55_helper(headers: &HeaderMap, payload: &str, entrypoint: &str, settings: &Settings) -> bool {
+    let body = rawjson::parse(payload);
+    if body.get("model").str() != "claude-haiku-5-5" || !helper_headers(headers, settings, true) {
+        return false;
+    }
+    let betas = joined_betas(headers);
+    if [
+        "interleaved-thinking-2025-05-14",
+        "thinking-token-count-2026-05-13",
+        "context-management-2025-06-27",
+        "prompt-caching-scope-2026-01-05",
+    ]
+    .iter()
+    .any(|required| !betas.split(',').any(|beta| beta == *required))
+    {
+        return false;
+    }
+    let metadata = body.get("metadata");
+    if !keys_exactly(metadata.json(), &["user_id"]) {
+        return false;
+    }
+    let user_id = metadata.get("user_id");
+    let identity = rawjson::parse(user_id.str());
+    let mut identity_keys = std::collections::HashSet::new();
+    let mut valid_keys = true;
+    identity.each(|key, _| {
+        valid_keys &= matches!(
+            key.str(),
+            "device_id" | "account_uuid" | "session_id" | "parent_session_id"
+        ) && identity_keys.insert(key.str().to_owned());
+        true
+    });
+    if !valid_keys
+        || identity_keys.len() < 3
+        || raw_header(headers, "x-claude-code-session-id") != identity.get("session_id").str()
+    {
+        return false;
+    }
+    let system = body.get("system");
+    let billing = system.get("0.text");
+    let entrypoint_field = format!("cc_entrypoint={entrypoint}");
+    if system.kind() != gjson::Kind::Array
+        || !billing.str().starts_with("x-anthropic-billing-header:")
+        || !billing.str().contains("cc_version=")
+        || !billing.str().split(';').any(|field| field.trim() == entrypoint_field)
+        || (billing.str().contains(" cch=") && !billing_has_cch(billing.str()))
+        || !super::cloak::is_cli_identity(system.get("1.text").str())
+    {
+        return false;
+    }
+    let messages = body.get("messages");
+    if body.get("max_tokens").kind() != gjson::Kind::Number
+        || messages.kind() != gjson::Kind::Array
+        || messages.array().len() != 1
+        || messages.get("0.role").str() != "user"
+    {
+        return false;
+    }
+    let tools = body.get("tools");
+    if tools.kind() != gjson::Kind::Array {
+        return false;
+    }
+    match tools.array().len() {
+        0 => {
+            let format = body.get("output_config.format");
+            let required = format.get("schema.required");
+            format.get("type").str() == "json_schema"
+                && format.get("schema.type").str() == "object"
+                && format.get("schema.properties.title.type").str() == "string"
+                && required.kind() == gjson::Kind::Array
+                && required.array().len() == 1
+                && required.get("0").str() == "title"
+                && format.get("schema.additionalProperties").kind() == gjson::Kind::False
+        }
+        1 => tools.get("0.name").str() == "web_search" && tools.get("0.type").str().starts_with("web_search_"),
+        _ => false,
+    }
 }
 
 fn helper_session(headers: &HeaderMap, payload: &str) -> bool {
@@ -529,6 +615,60 @@ mod tests {
             user_id()
         );
         (headers(&pairs), body)
+    }
+
+    #[test]
+    fn provider_safety_native_sdk_ts_requires_all_strong_signals() {
+        let (mut headers, body) = helper(
+            "claude-cli/2.1.280 (external, sdk-ts, agent-sdk/0.3.220)",
+            "0.112.1",
+            "v26.3.0",
+        );
+        headers.insert("anthropic-beta", "claude-code-20250219".parse().unwrap());
+        assert!(detect(&headers, &body, false, &Settings::default()).confirmed);
+        assert!(detect(&headers, "{}", true, &Settings::default()).confirmed);
+        assert!(!detect(&headers, "{}", false, &Settings::default()).confirmed);
+        headers.remove("x-app");
+        assert!(!detect(&headers, &body, false, &Settings::default()).confirmed);
+    }
+
+    #[test]
+    fn provider_safety_haiku55_helpers_require_measured_envelope_and_session() {
+        for entrypoint in ["cli", "sdk-cli", "sdk-ts", "claude-vscode"] {
+            let req = super::super::tests::safety_haiku55_request(entrypoint);
+            let headers = req.headers;
+            let body = String::from_utf8(req.body.to_vec()).unwrap();
+            let settings = Settings::default();
+            let detected = detect(&headers, &body, false, &settings);
+            assert!(detected.confirmed && detected.helper_profile, "{entrypoint}");
+            let search = rawjson::set_raw(
+                &body,
+                "tools",
+                r#"[{"name":"web_search","type":"web_search_20250305"}]"#,
+            );
+            assert!(detect(&headers, &search, false, &settings).helper_profile);
+            let unrelated = rawjson::set_raw(
+                &body,
+                "tools",
+                r#"[{"name":"custom","input_schema":{"type":"object"}}]"#,
+            );
+            assert!(!detect(&headers, &unrelated, false, &settings).confirmed);
+            let mut bad = headers.clone();
+            bad.insert(
+                "x-claude-code-session-id",
+                "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee".parse().unwrap(),
+            );
+            assert!(!detect(&bad, &body, false, &settings).confirmed);
+            let mut bad = headers.clone();
+            let betas =
+                joined_betas(&bad).replace("context-management-2025-06-27", "not-context-management-2025-06-27");
+            bad.insert("anthropic-beta", betas.parse().unwrap());
+            assert!(!detect(&bad, &body, false, &settings).confirmed);
+            let mut bad = headers.clone();
+            bad.insert("x-stainless-package-version", "0.1.0".parse().unwrap());
+            assert!(!detect(&bad, &body, false, &settings).confirmed);
+            assert!(!detect(&headers, &body.replace("cch=123ab;", "cch=wrong;"), false, &settings).confirmed);
+        }
     }
 
     /// A newer release's helper is confirmed with its own versions while its measured

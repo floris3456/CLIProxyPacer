@@ -306,7 +306,9 @@ pub async fn bind(cfg: &Config, target: &str, options: &LoginOptions) -> Result<
         .and_then(|r| r.get("proxy-url"))
         .and_then(|v| v.as_str())
         .unwrap_or_default();
-    let client = crate::proxy::GoClients::new(Default::default()).get(&crate::proxy::Proxy::parse(proxy));
+    let client = crate::proxy::GoClients::new(Default::default())
+        .get_checked(&crate::proxy::Proxy::parse(proxy))
+        .map_err(|error| BindError::Log(String::from_utf8_lossy(&error.body).into_owned()))?;
     bind_with(cfg, target, port, CodexOAuth::new(client), interaction).await
 }
 

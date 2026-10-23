@@ -498,4 +498,26 @@ mod tests {
         assert!(archive_unknown(&mut migrated).is_empty());
         assert_eq!(migrated, on);
     }
+
+    #[test]
+    fn claude_header_controls_survive_strict_writes_and_migration() {
+        let controls = yaml(
+            "upstream: {claude: {header-defaults: {anthropic-beta-strip: [old], anthropic-beta-append: [new], inject-diagnostics: false, client-request-id: passthrough}}}",
+        );
+        validate(&controls, true).unwrap();
+        let mut migrated = controls.clone();
+        assert!(archive_unknown(&mut migrated).is_empty());
+        assert_eq!(migrated, controls);
+        for field in [
+            "anthropic-beta-strip",
+            "anthropic-beta-append",
+            "inject-diagnostics",
+            "client-request-id",
+        ] {
+            let invalid = yaml(&format!(
+                "upstream: {{claude: {{header-defaults: {{{field}: {{invalid: true}}}}}}}}"
+            ));
+            assert!(validate(&invalid, true).is_err(), "{field}");
+        }
+    }
 }

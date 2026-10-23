@@ -17,6 +17,18 @@ pub(crate) struct HeaderDefaults {
     pub timeout: String,
     pub timezone: String,
     pub stabilize_device_profile: bool,
+    pub anthropic_beta_strip: Vec<String>,
+    pub anthropic_beta_append: Vec<String>,
+    pub inject_diagnostics: Option<bool>,
+    pub client_request_id: ClientRequestId,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum ClientRequestId {
+    #[default]
+    On,
+    Off,
+    Passthrough,
 }
 
 /// One `claude-api-key` entry after group inheritance (Go `config.ClaudeKey`).
@@ -65,6 +77,17 @@ impl Settings {
         let claude = at(doc, &["upstream", "claude"]);
         let h = claude.and_then(|c| c.get("header-defaults"));
         let field = |k: &str| text(h.and_then(|h| h.get(k)));
+        let names = |k: &str| {
+            h.and_then(|h| h.get(k))
+                .and_then(Value::as_sequence)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect()
+        };
         s.header_defaults = HeaderDefaults {
             user_agent: field("user-agent"),
             package_version: field("package-version"),
@@ -74,6 +97,14 @@ impl Settings {
             timeout: field("timeout"),
             timezone: field("timezone"),
             stabilize_device_profile: flag(h.and_then(|h| h.get("stabilize-device-profile"))),
+            anthropic_beta_strip: names("anthropic-beta-strip"),
+            anthropic_beta_append: names("anthropic-beta-append"),
+            inject_diagnostics: h.and_then(|h| h.get("inject-diagnostics")).and_then(Value::as_bool),
+            client_request_id: match field("client-request-id").trim().go_lower().as_str() {
+                "off" => ClientRequestId::Off,
+                "passthrough" => ClientRequestId::Passthrough,
+                _ => ClientRequestId::On,
+            },
         };
         s.disable_cloak_mode = flag(claude.and_then(|c| c.get("disable-claude-cloak-mode")));
         s.model_level_cooling = flag(claude.and_then(|c| c.get("model-level-cooling")));

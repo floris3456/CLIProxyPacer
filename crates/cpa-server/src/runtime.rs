@@ -337,20 +337,32 @@ impl Runtime {
         let request = crate::plugins::scheduler_request(self, &selection, &policy, &admit)?;
         let pick = crate::plugins::scheduler_pick(self, request).await?;
         let mut lease = self.store.select_picked(selection, policy, &admit, &ranks, pick)?;
-        if self.executors.readiness(&lease.credential, cfg) != Readiness::PrepareNow {
-            return Ok(lease);
+        // Claude may need a committed token rotation before resolving its identity.
+        // Two passes preserve that rotation even if profile acquisition then fails.
+        for _ in 0..2 {
+            if self.executors.readiness(&lease.credential, cfg) != Readiness::PrepareNow {
+                break;
+            }
+            let id = lease.credential.id.clone();
+            match self.prepare_credential(&id, cfg, None).await {
+                Ok(current) => {
+                    lease.credential = current;
+                    // Go stamps the dispatch after preparing the credential.
+                    lease.redispatch();
+                }
+                Err(error) => {
+                    lease.complete(Outcome::Failure(error.clone()));
+                    return Err(AcquireError::Prepare { id, error });
+                }
+            }
+            if lease.credential.provider != "claude" {
+                break;
+            }
         }
-        let id = lease.credential.id.clone();
-        match self.prepare_credential(&id, cfg, None).await {
-            Ok(current) => {
-                lease.credential = current;
-                // Go stamps the dispatch after preparing the credential.
-                lease.redispatch();
-            }
-            Err(error) => {
-                lease.complete(Outcome::Failure(error.clone()));
-                return Err(AcquireError::Prepare { id, error });
-            }
+        if let Err(error) = require_current_access_token(&lease.credential) {
+            let id = lease.credential.id.clone();
+            lease.complete(Outcome::Failure(error.clone()));
+            return Err(AcquireError::Prepare { id, error });
         }
         Ok(lease)
     }
@@ -370,6 +382,7 @@ impl Runtime {
         if self.executors.readiness(&credential, cfg) == Readiness::PrepareNow {
             credential = self.prepare_credential(id, cfg, None).await.ok()?;
         }
+        require_current_access_token(&credential).ok()?;
         // Outside selection: the lease answers no bounded window or probe reservation.
         let (picked, seq) = {
             let mut scheduler = self.store.scheduler.lock().unwrap_or_else(PoisonError::into_inner);
@@ -440,19 +453,34 @@ impl Runtime {
     /// serialized per credential ID. Home owns the stored credential, so nothing is
     /// committed locally.
     pub(crate) async fn prepare_remote(&self, lease: &mut Lease, cfg: &Config) -> Result<(), ExecError> {
+        // Home owns refresh tokens; never rotate one on a transient local copy.
+        require_current_access_token(&lease.credential)?;
         if self.executors.readiness(&lease.credential, cfg) != Readiness::PrepareNow {
             return Ok(());
         }
         let lock = self.store.prepare_lock(&lease.credential.id);
         let _guard = lock.lock().await;
-        let patch = self
-            .executors
-            .prepare(&self.for_executor(&lease.credential), cfg)
-            .await?;
+        // A token may have expired while another request held the preparation lock.
+        require_current_access_token(&lease.credential)?;
+        let mut view = (*self.for_executor(&lease.credential)).clone();
+        // Provider preparation can refresh before expiry (Antigravity) or after an
+        // intervening await (Claude). Only this temporary view loses the grants;
+        // identity lookups remain possible. Meta delegates its mint to Home and needs
+        // its full metadata to calculate which fields Home's replacement removes.
+        if view.provider != "meta" {
+            for key in ["refresh_token", "refreshToken"] {
+                view.metadata.remove(key);
+                view.attributes.remove(key);
+                if let Some(siwc) = view.metadata.get_mut("siwc").and_then(Value::as_object_mut) {
+                    siwc.remove(key);
+                }
+            }
+        }
+        let patch = self.executors.prepare(&view, cfg).await?;
         let mut prepared = (*lease.credential).clone();
         patch.apply(&mut prepared.metadata);
         lease.credential = Arc::new(prepared);
-        Ok(())
+        require_current_access_token(&lease.credential)
     }
 
     /// Prepares and commits one credential. `failed` is the revision whose token an
@@ -775,6 +803,17 @@ impl Drop for Runtime {
 /// Where cooldowns persist: `auth-dir` while `save-cooldown-status` is on.
 fn cooldown_dir(cfg: &Config, policy: &Policy) -> Option<std::path::PathBuf> {
     policy.save_cooldown_status.then(|| cfg.auth_dir.clone())
+}
+
+fn require_current_access_token(credential: &Credential) -> Result<(), ExecError> {
+    if cpa_exec::access_token_expired(credential, chrono::Utc::now()) {
+        return Err(ExecError::local(
+            401,
+            FailureScope::Credential,
+            "access token is expired",
+        ));
+    }
+    Ok(())
 }
 
 /// Go `refreshFailureBackoff`: an unauthorized refresh waits this long after a refresh
@@ -1882,15 +1921,19 @@ impl CredentialStore {
                 lease.lcp.as_ref(),
                 now,
             );
-            // Go MarkResult: a 401 that cools the credential schedules a background
-            // refresh of the rejected token (feb63984; the runtime checks for a refresh
-            // credential). A forced cooldown counts even on a request-scoped 401.
+            // Only an unhandled credential 401 schedules refresh. A request-scoped
+            // rule owns its result even when it deliberately cools the credential.
             // ponytail: Codex only for now; other providers (Claude's included) still
             // refresh after a 401 inline only, until the post-replay port.
-            let rejected = matches!(outcome, Outcome::Failure(error)
-                if lease.credential.provider == "codex"
-                    && crate::classify::names_unauthorized(error)
-                    && lease.policy.error_action(&lease.credential, error).cooldown);
+            let rejected = if let Outcome::Failure(error) = outcome
+                && lease.credential.provider == "codex"
+                && crate::classify::is_unauthorized(error)
+            {
+                let action = lease.policy.error_action(&lease.credential, error);
+                !action.matched && action.cooldown
+            } else {
+                false
+            };
             // Go `publishErrorEvent` after MarkResult (and the availability-neutral record).
             if let (Outcome::Failure(error) | Outcome::Neutral(error), Some(queue)) = (outcome, self.error_events.get())
                 && queue.wants_errors()
@@ -4493,6 +4536,148 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn home_preparation_does_not_rotate_transient_refresh_tokens() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let app = axum::Router::new()
+            .route(
+                "/oauth/token",
+                axum::routing::post({
+                    let calls = calls.clone();
+                    move || async move {
+                        calls.lock().unwrap().push("refresh");
+                        r#"{"access_token":"sk-ant-oat-rotated","refresh_token":"rotated","expires_in":3600}"#
+                    }
+                }),
+            )
+            .route(
+                "/profile",
+                axum::routing::get({
+                    let calls = calls.clone();
+                    move || async move {
+                        calls.lock().unwrap().push("profile");
+                        r#"{"account":{"uuid":"home-account"}}"#
+                    }
+                }),
+            )
+            .fallback({
+                let calls = calls.clone();
+                move || async move {
+                    // Antigravity's fixed OAuth host must go through this local proxy.
+                    calls.lock().unwrap().push("proxy");
+                    axum::http::StatusCode::BAD_GATEWAY
+                }
+            });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let dir = std::env::temp_dir().join(format!("cpa-home-prepare-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut cfg = Config::parse("").unwrap();
+        cfg.auth_dir = dir.clone();
+        let mut antigravity = cred("antigravity.json", "antigravity", false);
+        antigravity.attributes.insert("proxy_url".into(), base.clone());
+        antigravity.metadata.extend([
+            ("access_token".into(), "home-ag-access".into()),
+            ("refresh_token".into(), "home-ag-refresh".into()),
+            ("project_id".into(), "home-project".into()),
+            (
+                "expired".into(),
+                (chrono::Utc::now() + chrono::Duration::minutes(4)).to_rfc3339().into(),
+            ),
+        ]);
+        let mut claude = crate::testing::local(cred("claude.json", "claude", false));
+        claude.metadata.extend([
+            ("access_token".into(), "sk-ant-oat-home".into()),
+            ("refresh_token".into(), "home-claude-refresh".into()),
+            ("refreshToken".into(), "home-claude-refresh-alias".into()),
+            ("claude_device_ids".into(), serde_json::json!(["a".repeat(64)])),
+            (
+                "expired".into(),
+                (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339().into(),
+            ),
+        ]);
+        let client = wreq::Client::builder().no_proxy().build().unwrap();
+        let oauth = cpa_exec::oauth::OAuth::with_endpoints(
+            client.clone(),
+            &format!("{base}/oauth/token"),
+            &format!("{base}/profile"),
+            &format!("{base}/roles"),
+        );
+        let rt = crate::testing::runtime(
+            cfg.clone(),
+            vec![antigravity, claude],
+            Executors {
+                claude: cpa_exec::claude::ClaudeExecutor::with_client(client, &base).with_oauth(oauth),
+                codex: Default::default(),
+                devices: Default::default(),
+                openai: Default::default(),
+                google: Default::default(),
+            },
+        );
+        let remote = |provider: &str| {
+            let mut lease = rt.store.select(sel(provider)).unwrap();
+            lease.remote = Some(crate::remote::RemoteEnd {
+                end: Some(Box::new(|| None)),
+                releases: Default::default(),
+                cancel: None,
+                private: Default::default(),
+            });
+            lease
+        };
+
+        // Still valid, but inside Antigravity's mandatory refresh window: the worker
+        // must fail locally instead of spending a Home-owned grant.
+        let mut ag = remote("antigravity");
+        let error = rt.prepare_remote(&mut ag, &cfg).await.unwrap_err();
+        assert_eq!(error.status, 401);
+        assert!(calls.lock().unwrap().is_empty());
+        assert_eq!(ag.credential.str("refresh_token"), Some("home-ag-refresh"));
+
+        // A valid Claude token can still acquire its missing identity. Grants remain
+        // on the lease and in the store; only the executor's temporary view omits them.
+        let mut identity = remote("claude");
+        rt.prepare_remote(&mut identity, &cfg).await.unwrap();
+        assert_eq!(identity.credential.str("account_uuid"), Some("home-account"));
+        assert_eq!(identity.credential.str("refresh_token"), Some("home-claude-refresh"));
+        assert_eq!(
+            identity.credential.str("refreshToken"),
+            Some("home-claude-refresh-alias")
+        );
+        assert!(rt.store.get("claude.json").unwrap().str("account_uuid").is_none());
+        assert_eq!(*calls.lock().unwrap(), ["profile"]);
+
+        // Prove the first expiry check passed before the lock wait, then let the
+        // access token expire. Claude's expired-first preparation would rotate it.
+        let mut waiting = remote("claude");
+        let expires = chrono::Utc::now() + chrono::Duration::seconds(1);
+        Arc::make_mut(&mut waiting.credential)
+            .metadata
+            .insert("expired".into(), expires.to_rfc3339().into());
+        let lock = rt.store.prepare_lock(&waiting.credential.id);
+        let guard = lock.lock().await;
+        let mut preparation = Box::pin(rt.prepare_remote(&mut waiting, &cfg));
+        assert!(futures_util::poll!(&mut preparation).is_pending());
+        let delay = (expires - chrono::Utc::now()).to_std().unwrap_or_default() + Duration::from_millis(20);
+        tokio::time::sleep(delay).await;
+        drop(guard);
+        let error = preparation.await.unwrap_err();
+        assert_eq!(error.status, 401);
+        assert_eq!(waiting.credential.str("access_token"), Some("sk-ant-oat-home"));
+        assert_eq!(waiting.credential.str("refresh_token"), Some("home-claude-refresh"));
+        assert_eq!(
+            *calls.lock().unwrap(),
+            ["profile"],
+            "no transient refresh reached the mock"
+        );
+        assert_eq!(
+            rt.store.get("claude.json").unwrap().str("refresh_token"),
+            Some("home-claude-refresh")
+        );
+        server.abort();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
     async fn preparation_waiter_observes_deletion_and_refresh_loop_is_replaceable() {
         let rt = Arc::new(crate::testing::runtime(
             Config::parse("").unwrap(),
@@ -4825,10 +5010,8 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// Which 401s schedule a background refresh: Codex ones that cool the credential,
-    /// including a request-scoped 401 a `*-and-cooldown` rule cools; not Claude's (that
-    /// waits for the post-replay port). A scan whose snapshot predates a newer revision
-    /// keeps the 401 recorded on it.
+    /// Only unhandled credential 401s schedule background refresh. Request-scoped
+    /// rules can cool a credential without rotating it. Stale scans retain newer 401s.
     #[test]
     fn which_401s_schedule_a_background_refresh() {
         let codex = |note: &str| {
@@ -4865,7 +5048,9 @@ mod tests {
         assert_eq!(pending(), [], "Claude, and an unforced request-scoped 401");
         fail("codex", "m", FailureScope::Request, "token revoked");
         let first = store.get("codex.json").unwrap().revision;
-        assert_eq!(pending(), [("codex.json".to_owned(), first)], "a forced cooldown");
+        assert_eq!(pending(), [], "a request-scoped rule never refreshes");
+        fail("codex", "unhandled", FailureScope::Credential, "unauthorized");
+        assert_eq!(pending(), [("codex.json".to_owned(), first)]);
         // The scan's snapshot holds the first revision; a refresh commits a newer one,
         // which an upstream rejects too, before the scan reads the rejections.
         let old = store.snapshot();
@@ -4875,7 +5060,7 @@ mod tests {
         ]);
         let second = store.get("codex.json").unwrap().revision;
         assert!(second > first);
-        fail("codex", "n", FailureScope::Request, "token revoked");
+        fail("codex", "n", FailureScope::Credential, "unauthorized");
         store.forget_stale_unauthorized(&store.unauthorized(), &old);
         assert_eq!(
             pending(),
