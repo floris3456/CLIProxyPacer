@@ -107,7 +107,15 @@ jobs:
           persist-credentials: false
       - name: Build tools
         # BoringSSL (through btls-sys) needs cmake, clang and perl; bindgen needs libclang.
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake clang libclang-dev perl
+        # Try the runner's package index first; unrelated apt mirrors can stall update.
+        timeout-minutes: 5
+        run: |
+          build_apt=(sudo apt-get -o Acquire::Retries=1 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20)
+          build_packages=(cmake clang libclang-dev perl)
+          if ! "${build_apt[@]}" install -y --no-upgrade --no-install-recommends "${build_packages[@]}"; then
+            "${build_apt[@]}" update
+            "${build_apt[@]}" install -y --no-upgrade --no-install-recommends "${build_packages[@]}"
+          fi
       - name: Rust
         run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy && rustup default "$RUST_TOOLCHAIN"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
@@ -245,7 +253,14 @@ jobs:
         with:
           persist-credentials: false
       - name: Build tools
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake clang libclang-dev perl
+        timeout-minutes: 5
+        run: |
+          build_apt=(sudo apt-get -o Acquire::Retries=1 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20)
+          build_packages=(cmake clang libclang-dev perl)
+          if ! "${build_apt[@]}" install -y --no-upgrade --no-install-recommends "${build_packages[@]}"; then
+            "${build_apt[@]}" update
+            "${build_apt[@]}" install -y --no-upgrade --no-install-recommends "${build_packages[@]}"
+          fi
       - name: Rust
         run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal && rustup default "$RUST_TOOLCHAIN"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
