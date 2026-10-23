@@ -166,12 +166,26 @@ jobs:
         # gate (crates/cpa-server/tests/alloc_budget.rs) and the tests with wall-clock
         # bounds alone. Nextest skips doc tests, so cargo test runs those, then the tests
         # of the patched gjson in vendor/, which is outside the workspace.
+        # Prebuild Go fixtures once; each Nextest test still runs in its own process.
         # CPA_TEST_NO_SKIP makes a test that would skip for a missing Go toolchain or
         # PostgreSQL fail instead: a passing test's output is captured, so a printed skip
         # line never reaches the log.
         run: |
           tests='
-            cargo nextest run --workspace --locked --profile ci 2>&1 | tee test.log
+            plugin_build=$(mktemp -d "$PWD/target/go-plugin-fixtures.XXXXXX")
+            (
+              cd crates/cpa-plugin/tests/goplugins
+              mkdir "$plugin_build/telemetry"
+              printf off > "$plugin_build/telemetry/mode"
+              export CGO_ENABLED=1 GONOPROXY=none GOPRIVATE= GOSUMDB=off GOFLAGS=-mod=readonly
+              export TEST_TELEMETRY_DIR="$plugin_build/telemetry"
+              for example in examples/*; do
+                go build -mod=readonly -buildmode=c-shared \
+                  -o "$plugin_build/${example##*/}.so" "./$example"
+              done
+            )
+            CPA_TEST_GOPLUGINS_DIR="$plugin_build" cargo nextest run --workspace --locked --profile ci 2>&1 | tee test.log
+            rm -rf -- "$plugin_build"
             cargo test --workspace --doc --locked 2>&1 | tee -a test.log
             cargo test --locked --manifest-path vendor/gjson/Cargo.toml --target-dir target 2>&1 | tee -a test.log
             python3 bench/test-claude-cache-replay.py 2>&1 | tee -a test.log
