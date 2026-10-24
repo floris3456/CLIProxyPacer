@@ -264,7 +264,7 @@ mod tests {
                     actual.push(snapshot(v));
                     actual.len() < limit
                 });
-                assert_eq!(actual, expected, "{text}: limit {limit}");
+                assert!(actual == expected, "{text}: limit {limit}");
             }
         }
     }
