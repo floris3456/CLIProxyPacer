@@ -493,7 +493,7 @@ async fn token_exchange_uses_the_credential_proxy() {
     let cred = credential(s, &cfg, "127.0.0.1:1", credential_proxy.trim_start_matches("http://"));
     let executor = VertexExecutor::with_hooks(Hooks::default(), now);
     let sa = cred.metadata["service_account"].as_object().unwrap().clone();
-    let result = vertex_auth::access_token(&executor.client(&cred, &cfg), &sa, now()).await;
+    let result = vertex_auth::access_token(&executor.client(&cred, &cfg).unwrap(), &sa, now()).await;
     assert!(result.is_err(), "{result:?}");
     assert!(
         credential_hits.load(Ordering::SeqCst) > 0,

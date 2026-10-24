@@ -439,11 +439,11 @@ fn global_proxy(state: &Management) -> Proxy {
 
 /// The client for login traffic: the global proxy (else the environment's proxies);
 /// local endpoints in tests.
-pub(super) fn login_client(state: &Management) -> wreq::Client {
+pub(super) fn login_client(state: &Management) -> Result<wreq::Client, ExecError> {
     if state.login_base.is_some() {
-        return state.clients.get(&Proxy::Direct);
+        return state.clients.get_checked(&Proxy::Direct);
     }
-    state.clients.get(&global_proxy(state))
+    state.clients.get_checked(&global_proxy(state))
 }
 
 /// Go `StartOAuthV8`.
@@ -690,8 +690,12 @@ async fn start_claude(state: Arc<Management>, webui: bool) -> Response {
         if let Some(code) = wait_for_callback(&worker, &login.state, "anthropic", "Bad request").await {
             let exchanged = match &worker.login_base {
                 Some(base) => {
+                    let client = match login_client(&worker) {
+                        Ok(client) => client,
+                        Err(error) => return fail_session(&worker, &login.state, &exec_text(&error)),
+                    };
                     let oauth = cpa_exec::oauth::OAuth::with_endpoints(
-                        login_client(&worker),
+                        client,
                         &format!("{base}/v1/oauth/token"),
                         &format!("{base}/api/oauth/profile"),
                         &format!("{base}/api/oauth/claude_cli/roles"),
@@ -706,7 +710,7 @@ async fn start_claude(state: Arc<Management>, webui: bool) -> Response {
                     let slot = legacy.clone();
                     let write = move |dir: PathBuf, patch| {
                         let (path, old) = ManagedLogin::save(&dir, patch).map_err(|e| exec_text(&e))?;
-                        *slot.lock().unwrap_or_else(PoisonError::into_inner) = old;
+                        *slot.lock().unwrap_or_else(PoisonError::into_inner) = old.map(|old| (path.clone(), old));
                         Ok(path)
                     };
                     let saved = save_if_pending(
@@ -720,7 +724,7 @@ async fn start_claude(state: Arc<Management>, webui: bool) -> Response {
                     .await;
                     let old = legacy.lock().unwrap_or_else(PoisonError::into_inner).take();
                     match (saved, old) {
-                        (Outcome::Saved, Some(old)) => remove_legacy_claude(&worker, old).await,
+                        (Outcome::Saved, Some((canonical, old))) => remove_legacy_claude(&worker, canonical, old).await,
                         (saved, _) => saved,
                     }
                 }
@@ -736,17 +740,19 @@ async fn start_claude(state: Arc<Management>, webui: bool) -> Response {
 /// Go `saveTokenRecord` after the canonical Claude credential is stored: the matching
 /// legacy file is deleted through the token store (`store.Delete`), so a git store
 /// commits the removal its watcher guard would refuse.
-async fn remove_legacy_claude(state: &Arc<Management>, legacy: PathBuf) -> Outcome {
+async fn remove_legacy_claude(state: &Arc<Management>, canonical: PathBuf, legacy: PathBuf) -> Outcome {
     let worker = state.clone();
     let removed = tokio::task::spawn_blocking(move || {
         let _guard = worker.disk.lock().unwrap_or_else(PoisonError::into_inner);
-        if worker.store.is_some() {
-            return worker.store_delete(&legacy);
-        }
-        match std::fs::remove_file(&legacy) {
-            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.to_string()),
-            _ => Ok(()),
-        }
+        cpa_exec::claude_login::remove_legacy_if_matching(&canonical, &legacy, |path| {
+            if worker.store.is_some() {
+                return worker.store_delete(path);
+            }
+            match std::fs::remove_file(path) {
+                Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.to_string()),
+                _ => Ok(()),
+            }
+        })
     })
     .await;
     match removed {
@@ -782,7 +788,10 @@ async fn start_codex(state: Arc<Management>, webui: bool) -> Response {
     let flow = sid.clone();
     tokio::spawn(async move {
         if let Some(code) = wait_for_callback(&worker, &flow, "codex", "Bad Request").await {
-            let client = login_client(&worker);
+            let client = match login_client(&worker) {
+                Ok(client) => client,
+                Err(error) => return fail_session(&worker, &flow, &exec_text(&error)),
+            };
             let oauth = match &worker.login_base {
                 Some(base) => CodexOAuth::with_endpoints(
                     client,
@@ -852,7 +861,10 @@ async fn start_antigravity(state: Arc<Management>, webui: bool) -> Response {
                 if cb.code.is_empty() {
                     return Outcome::Failed("Authentication failed: code not found".into());
                 }
-                let client = login_client(&worker);
+                let client = match login_client(&worker) {
+                    Ok(client) => client,
+                    Err(error) => return Outcome::Failed(exec_text(&error)),
+                };
                 let oauth = match &worker.login_base {
                     Some(base) => OAuth::with_endpoints(
                         client,
@@ -954,7 +966,11 @@ async fn start_devin(state: Arc<Management>) -> Response {
     let Some(sid) = random_state() else {
         return fail(StatusCode::INTERNAL_SERVER_ERROR, "failed to generate state parameter");
     };
-    let mut auth = DevinAuth::new(login_client(&state));
+    let client = match login_client(&state) {
+        Ok(client) => client,
+        Err(error) => return fail(StatusCode::BAD_GATEWAY, exec_text(&error)),
+    };
+    let mut auth = DevinAuth::new(client);
     if let Some(base) = &state.login_base {
         auth = auth.with_app_base(base).with_api_base(base).with_server_base(base);
     }
@@ -1054,7 +1070,11 @@ async fn start_kimi(state: Arc<Management>, domain: String) -> Response {
         ("kimi", "kmi")
     };
     let sid = format!("{prefix}-{}", unix_nanos());
-    let mut flow = DeviceFlow::new(login_client(&state), &domain, "");
+    let client = match login_client(&state) {
+        Ok(client) => client,
+        Err(error) => return fail(StatusCode::BAD_GATEWAY, exec_text(&error)),
+    };
+    let mut flow = DeviceFlow::new(client, &domain, "");
     if let Some(base) = &state.login_base {
         flow = flow.with_oauth_host(base);
     }
@@ -1116,7 +1136,11 @@ async fn start_meta(state: Arc<Management>) -> Response {
     use cpa_exec::meta_auth::{MetaAuth, create_token_storage, save_login};
     const MAX_POLL_SECONDS: i64 = 15 * 60;
     let sid = format!("meta-{}", unix_nanos());
-    let mut auth = MetaAuth::new(login_client(&state));
+    let client = match login_client(&state) {
+        Ok(client) => client,
+        Err(error) => return fail(StatusCode::BAD_GATEWAY, exec_text(&error)),
+    };
+    let mut auth = MetaAuth::new(client);
     if let Some(base) = &state.login_base {
         auth = auth
             .with_auth_host(base)
@@ -1167,7 +1191,11 @@ async fn start_meta(state: Arc<Management>) -> Response {
 async fn start_xai(state: Arc<Management>) -> Response {
     use cpa_exec::xai_auth::{LoginRecord, MAX_POLL_DURATION, XaiAuth, login_record, saved_document};
     let sid = format!("xai-{}", unix_nanos());
-    let mut auth = XaiAuth::new(login_client(&state));
+    let client = match login_client(&state) {
+        Ok(client) => client,
+        Err(error) => return fail(StatusCode::BAD_GATEWAY, exec_text(&error)),
+    };
+    let mut auth = XaiAuth::new(client);
     if let Some(base) = &state.login_base {
         auth = auth
             .with_issuer_origin(base)
@@ -1193,12 +1221,11 @@ async fn start_xai(state: Arc<Management>) -> Response {
     // Go `saveTokenRecord` through the file token store: merged with an existing file.
     fn save_login(dir: &std::path::Path, record: LoginRecord) -> Result<PathBuf, String> {
         let path = dir.join(&record.file_name);
-        let existing = std::fs::read(&path).ok().filter(|raw| !raw.is_empty());
+        let file = cpa_exec::codex_siwc_bind::CredentialFileLease::acquire_for_write(&path)?;
+        let existing = std::fs::read(file.path()).ok().filter(|raw| !raw.is_empty());
         let document = saved_document(record.metadata, existing.as_deref())?;
         let text = cpa_common::json::GoValue::Object(document).encode_indented();
-        std::fs::create_dir_all(dir)
-            .and_then(|()| super::auth_files::write_file(&path, &text))
-            .map_err(|e| e.to_string())?;
+        super::auth_files::write_file(file.path(), &text).map_err(|e| e.to_string())?;
         Ok(path)
     }
     let worker = state.clone();

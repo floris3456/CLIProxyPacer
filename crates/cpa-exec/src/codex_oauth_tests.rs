@@ -146,6 +146,71 @@ async fn exchange_and_refresh_wire_and_results_match_go() {
 }
 
 #[tokio::test]
+async fn authorization_code_errors_never_echo_endpoint_secrets() {
+    let mock = Mock::start().await;
+    let oauth = oauth(&mock).await;
+    for (status, body) in [
+        (
+            400,
+            r#"{"error":"private_code","error_description":"private_verifier","access_token":"private_access","refresh_token":"private_refresh"}"#,
+        ),
+        (503, "private_code private_verifier private_access private_refresh"),
+    ] {
+        mock.script("/oauth/token", vec![json(status, body)]);
+        let error = oauth
+            .exchange("private_code", &redirect_uri(DEFAULT_CALLBACK_PORT), "private_verifier")
+            .await
+            .unwrap_err();
+        assert_eq!(error.status, status);
+        assert_eq!(error.scope, FailureScope::Credential);
+        assert_eq!(
+            &error.body[..],
+            format!("token exchange failed with status {status}").as_bytes()
+        );
+        let requests = mock.take();
+        assert_eq!(requests.len(), 1);
+        let sent = String::from_utf8_lossy(&requests[0].body);
+        assert!(sent.contains("code=private_code"));
+        assert!(sent.contains("code_verifier=private_verifier"));
+    }
+}
+
+#[tokio::test]
+async fn oauth_redirects_never_receive_codes_verifiers_or_refresh_tokens() {
+    use crate::codex_testkit::Reply;
+
+    let issuer = Mock::start().await;
+    let sink = Mock::start().await;
+    let oauth = oauth(&issuer).await;
+    for status in [301, 302, 303, 307, 308] {
+        issuer.script(
+            "/oauth/token",
+            vec![Reply {
+                status,
+                headers: vec![("Location".into(), format!("{}/stolen", sink.url))],
+                body: "do not expose this response body".into(),
+            }],
+        );
+        sink.script("/stolen", vec![json(200, &token_body())]);
+        let error = oauth
+            .post(
+                &format!("{}/oauth/token", issuer.url),
+                "application/x-www-form-urlencoded",
+                b"code=private-code&code_verifier=private-verifier&refresh_token=private-refresh".to_vec(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.status, 502);
+        assert_eq!(&error.body[..], b"codex oauth endpoint redirects are not allowed");
+        assert_eq!(issuer.take().len(), 1);
+        assert!(
+            sink.take().is_empty(),
+            "OAuth redirect {status} reached a second endpoint"
+        );
+    }
+}
+
+#[tokio::test]
 async fn refresh_retry_policy_matches_go_attempt_counts() {
     let mock = Mock::start().await;
     for (name, replies, refresh) in [

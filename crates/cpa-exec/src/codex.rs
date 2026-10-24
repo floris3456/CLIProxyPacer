@@ -244,7 +244,7 @@ impl CodexExecutor {
         // `NewCodexAuthWithProxyURL(cfg, auth.ProxyURL)`: the credential's proxy, then the
         // global one, on Go's standard transport.
         let proxy = crate::proxy::Proxy::effective(credential, cfg);
-        let oauth = self.oauth.with_client(self.transport.standard(&proxy));
+        let oauth = self.oauth.with_client(self.transport.standard(&proxy)?);
         let outer = if outer {
             Some(oauth.refresh_patch(codex_oauth::refresh_token(credential)).await)
         } else {
@@ -330,7 +330,7 @@ impl CodexExecutor {
         let (proxy, keep_alive, handshake) = (&view.proxy, view.chatgpt_keep_alive, view.handshake);
         let route = |hop: &url::Url| {
             Ok(crate::proxy::Route {
-                client: transport.for_url(hop.as_str(), proxy, keep_alive, handshake),
+                client: transport.for_url(hop.as_str(), proxy, keep_alive, handshake)?,
                 order: None,
             })
         };

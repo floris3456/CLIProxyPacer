@@ -34,6 +34,7 @@ pub mod pprof;
 mod realtime;
 mod refresh;
 pub mod registry;
+mod rejected_tokens;
 mod relay;
 pub mod remote;
 pub mod request_logging;

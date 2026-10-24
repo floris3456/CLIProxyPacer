@@ -707,6 +707,7 @@ fn credential(response: &DispatchResponse, requested: &str) -> Result<Credential
         attributes,
         metadata,
         revision: 0,
+        parsed_by_plugin: false,
         next_refresh_after: None,
     };
     // Go `attachResolvedHomeModelInfo` inputs, fixed for the lease: Home's definition of

@@ -9,6 +9,29 @@ use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 use tokio::io::AsyncReadExt;
 
+#[test]
+fn invalid_proxy_cannot_fall_back_to_direct_or_an_injected_client() {
+    let transport = Transport::with_default(wreq::Client::new());
+    for proxy in [
+        Proxy::Invalid,
+        Proxy::Url("ftp://user:proxy-secret@proxy.invalid:21".into()),
+        Proxy::Url("http://user:proxy-secret@proxy.invalid:0".into()),
+    ] {
+        for url in [
+            "https://chatgpt.com/backend-api/codex/responses",
+            "http://127.0.0.1:1/v1/responses",
+        ] {
+            let error = transport
+                .for_url(url, &proxy, false, None)
+                .err()
+                .expect("invalid proxy accepted");
+            assert_eq!(&error.body[..], b"invalid upstream proxy configuration");
+        }
+        assert!(transport.standard(&proxy).is_err());
+    }
+    assert!(transport.chrome.lock().unwrap().is_empty());
+}
+
 fn grease(v: u16) -> bool {
     v & 0x0f0f == 0x0a0a && v >> 8 == v & 0xff
 }
@@ -111,7 +134,7 @@ async fn capture() -> Vec<u8> {
     });
     let url = format!("https://chatgpt.com:{}/backend-api/codex/responses", address.port());
     // The default (keep-alive off), as Go dials it.
-    let client = transport.for_url(&url, &Proxy::Inherit, false, None);
+    let client = transport.for_url(&url, &Proxy::Inherit, false, None).unwrap();
     assert!(client.post(&url).send().await.is_err(), "the listener never answers");
     capture.await.unwrap()
 }
@@ -370,6 +393,7 @@ async fn get_ok(transport: &Transport, url: &str, proxy: &Proxy) {
 async fn get_ok_with(transport: &Transport, url: &str, proxy: &Proxy, keep_alive: bool) {
     let response = transport
         .for_url(url, proxy, keep_alive, None)
+        .unwrap()
         .get(url)
         .send()
         .await

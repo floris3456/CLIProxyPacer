@@ -1787,6 +1787,7 @@ mod tests {
             attributes: attrs.iter().map(|(k, v)| ((*k).into(), (*v).into())).collect(),
             metadata: meta.as_object().unwrap().clone(),
             revision: 0,
+            parsed_by_plugin: false,
             next_refresh_after: None,
         };
         c.attributes.insert("auth_kind".into(), "apikey".into());

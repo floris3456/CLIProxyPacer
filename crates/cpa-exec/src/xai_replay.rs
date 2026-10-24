@@ -4,8 +4,8 @@
 //!
 //! Grok returns encrypted reasoning that clients without server-side state drop from the
 //! next turn. After a completed response the executor caches the replayable output items
-//! (reasoning, assistant message, tool calls) per (model, session), and the next request
-//! of that session gets the items its input lacks inserted before the matching turn.
+//! (reasoning, assistant message, tool calls) per (caller, credential, model, session).
+//! The next request gets the items its input lacks inserted before the matching turn.
 //!
 //! In Home mode the cache lives in Home KV (`cpa:xai:reasoning-replay:*`) as Go writes
 //! it, so every node replays the same session state.
@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 use cpa_common::gostr::GoStr;
 use cpa_common::json::{self as gj, Kind, Res};
 use cpa_common::thinking::parse_suffix;
+use cpa_core::credential::Credential;
 use cpa_core::exec::ExecRequest;
 use cpa_core::format::Format;
 use sha2::{Digest, Sha256};
@@ -196,7 +197,12 @@ fn text(r: &Res<'_>) -> String {
 
 /// `xaiReasoningReplayScopeFromRequest`: Claude and OpenAI Responses clients only, and
 /// not for a downstream WebSocket turn that continues upstream state.
-pub(crate) fn scope(req: &ExecRequest, body: &[u8], downstream_websocket: bool) -> ReplayScope {
+pub(crate) fn scope(
+    credential: &Credential,
+    req: &ExecRequest,
+    body: &[u8],
+    downstream_websocket: bool,
+) -> ReplayScope {
     if !matches!(req.source_format, Format::Claude | Format::OpenAIResponse) {
         return ReplayScope::default();
     }
@@ -205,7 +211,7 @@ pub(crate) fn scope(req: &ExecRequest, body: &[u8], downstream_websocket: bool) 
     }
     ReplayScope {
         model_name: parse_suffix(&req.model).model_name,
-        session_key: isolate(req, &session_key(req, body)),
+        session_key: isolate(credential, req, &session_key(req, body)),
         writes: Default::default(),
     }
 }
@@ -231,20 +237,37 @@ fn session_key(req: &ExecRequest, body: &[u8]) -> String {
         .unwrap_or_default()
 }
 
-/// `xaiReasoningReplayIsolateSessionKey`: client-controlled keys are namespaced by the
-/// caller's API key, and disabled without one.
-fn isolate(req: &ExecRequest, key: &str) -> String {
+/// Client-controlled keys require an authenticated caller. Both client and execution
+/// sessions are also bound to the selected credential, so an account rotation cannot
+/// reuse another account's encrypted reasoning. Caller identity is trusted context,
+/// never a downstream header or metadata field.
+fn isolate(credential: &Credential, req: &ExecRequest, key: &str) -> String {
     let key = key.trim();
-    if key.is_empty() || key.starts_with("execution:") {
-        return key.to_owned();
-    }
-    let api_key = req.caller.principal.trim();
-    if api_key.is_empty() {
+    if key.is_empty()
+        || credential.id.is_empty()
+        || (!key.starts_with("execution:") && req.caller.principal.trim().is_empty())
+    {
         return String::new();
     }
-    let digest = Sha256::digest(api_key.as_bytes());
-    let prefix: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
-    format!("caller:{prefix}:{key}")
+    let (_, endpoint) = crate::xai::creds(credential);
+    let mut digest = Sha256::new();
+    for field in [
+        "xai-replay-scope-v1",
+        req.caller.provider.as_str(),
+        req.caller.principal.as_str(),
+        credential.provider.as_str(),
+        credential.id.as_str(),
+        credential.str("email").unwrap_or_default(),
+        endpoint.trim().trim_end_matches('/'),
+        key,
+    ] {
+        digest.update((field.len() as u64).to_be_bytes());
+        digest.update(field.as_bytes());
+    }
+    // Credentials keep their identity through access/refresh token and revision
+    // changes. Keep keys free of plaintext caller keys and provider tokens.
+    let digest: String = digest.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    format!("isolated:v1:{digest}")
 }
 
 /// `applyXAIReasoningReplayCacheRequired` after the scope is known. A read failure
@@ -728,6 +751,65 @@ fn insert_items(body: &[u8], replay: &[Vec<u8>]) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn replay_stays_with_selected_credential_through_token_rotation() {
+        use base64::Engine;
+        const BODY: &str = r#"{"input":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"answer"}]},{"type":"message","role":"user","content":[{"type":"input_text","text":"next"}]}]}"#;
+        let fixture = serde_json::json!({
+            "credential": {"type": "xai", "email": "owner@example.invalid", "access_token": "old-access"},
+            "request": {
+                "source": "openai-response", "model": "grok-4", "body": BODY,
+                "headers": [["session-id", "account-isolation"]]
+            }
+        });
+        let account = crate::kimi_fixture::credential("xai", &fixture, None);
+        let owner = crate::kimi_fixture::request(&fixture, "caller-a");
+        // A shape-valid mock ciphertext exercises actual reasoning restoration.
+        let encrypted = base64::engine::general_purpose::STANDARD_NO_PAD.encode((0u8..64).collect::<Vec<_>>());
+        let completed = serde_json::to_vec(&serde_json::json!({"response": {"output": [
+            {"type": "reasoning", "encrypted_content": encrypted},
+            {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "answer"}]}
+        ]}}))
+        .unwrap();
+        for execution in [None, Some("trusted-execution")] {
+            let store = Store::default();
+            let mut request = owner.clone();
+            request.execution_session = execution.map(str::to_owned);
+            let first = scope(&account, &request, BODY.as_bytes(), false);
+            cache_completed(&store, &first, &completed);
+
+            let mut refreshed = account.clone();
+            refreshed.metadata.insert("access_token".into(), "new-access".into());
+            refreshed
+                .metadata
+                .insert("refresh_token".into(), "rotated-refresh".into());
+            refreshed.revision += 1;
+            let mut rotated = refreshed.clone();
+            rotated.id = "different-account.json".into();
+            for (credential, expected) in [(&refreshed, true), (&rotated, false), (&account, true)] {
+                let next = scope(credential, &request, BODY.as_bytes(), false);
+                let body = apply(&store, &next, BODY.as_bytes().to_vec()).await;
+                let restored = text(&gj::get(&body, "input.0.encrypted_content"));
+                if expected {
+                    assert_eq!(
+                        restored, encrypted,
+                        "execution={execution:?}, credential={}",
+                        credential.id
+                    );
+                } else {
+                    assert_eq!(body, BODY.as_bytes());
+                }
+            }
+            let mut another_auth_provider = request.clone();
+            another_auth_provider.caller.provider = "other-auth-provider".into();
+            let other_scope = scope(&account, &another_auth_provider, BODY.as_bytes(), false);
+            assert_eq!(
+                apply(&store, &other_scope, BODY.as_bytes().to_vec()).await,
+                BODY.as_bytes()
+            );
+        }
+    }
 
     #[test]
     fn long_call_ids_shorten_like_go() {

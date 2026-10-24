@@ -302,6 +302,27 @@ impl OAuth {
         .await
     }
 
+    /// Token grants stay at their fixed endpoint, including on 307/308 responses.
+    async fn post_token(&self, headers: GoHeaders, body: Vec<u8>) -> Result<Upstream, ExecError> {
+        let upstream = proxy::request_once(
+            &self.client,
+            wreq::Method::POST,
+            &self.token_endpoint,
+            headers,
+            Some(Bytes::from(body)),
+            None,
+        )
+        .await?;
+        if (300..400).contains(&upstream.status) {
+            return Err(ExecError::local(
+                502,
+                FailureScope::Transport,
+                "antigravity token endpoint redirects are not allowed",
+            ));
+        }
+        Ok(upstream)
+    }
+
     /// `ExchangeCodeForTokens`.
     pub async fn exchange_code(&self, code: &str, redirect_uri: &str) -> Result<Tokens, AuthError> {
         const STEP: &str = "antigravity token exchange";
@@ -315,7 +336,7 @@ impl OAuth {
         let mut headers = GoHeaders::new();
         headers.set("Content-Type", "application/x-www-form-urlencoded");
         let upstream = self
-            .post(&self.token_endpoint, headers, form.into_bytes(), None)
+            .post_token(headers, form.into_bytes())
             .await
             .map_err(|e| AuthError::plain(format!("{STEP}: execute request: {}", transport_text(&e))))?;
         let status = upstream.status;
@@ -502,9 +523,7 @@ impl OAuth {
         headers.set("Host", "oauth2.googleapis.com");
         headers.set("Content-Type", "application/x-www-form-urlencoded");
         headers.set("User-Agent", "Go-http-client/2.0");
-        let upstream = self
-            .post(&self.token_endpoint, headers, form.into_bytes(), None)
-            .await?;
+        let upstream = self.post_token(headers, form.into_bytes()).await?;
         let status = upstream.status;
         let data = proxy::read_all(upstream.body, usize::MAX, false).await?;
         if !(200..300).contains(&status) {
@@ -707,7 +726,26 @@ pub(crate) async fn prepare(
     credential: &Credential,
     cfg: &Config,
 ) -> Result<MetadataPatch, ExecError> {
-    let oauth = OAuth::new(clients.get(&Proxy::effective(credential, cfg)));
+    prepare_with(clients, credential, cfg, false).await
+}
+
+/// Go `Refresh`: refresh even if the existing token appears fresh. Project discovery
+/// uses the replacement token, and its failure cannot discard successful rotation.
+pub(crate) async fn prepare_forced(
+    clients: &GoClients,
+    credential: &Credential,
+    cfg: &Config,
+) -> Result<MetadataPatch, ExecError> {
+    prepare_with(clients, credential, cfg, true).await
+}
+
+async fn prepare_with(
+    clients: &GoClients,
+    credential: &Credential,
+    cfg: &Config,
+    force_refresh: bool,
+) -> Result<MetadataPatch, ExecError> {
+    let oauth = OAuth::new(clients.get_checked(&Proxy::effective(credential, cfg))?);
     let now = Utc::now();
     let mut patch = MetadataPatch::default();
     let mut access = meta_string(credential, "access_token").to_owned();
@@ -725,7 +763,7 @@ pub(crate) async fn prepare(
             }
         }
     };
-    let refreshed = !missing || access.is_empty() || !fresh;
+    let refreshed = force_refresh || !missing || access.is_empty() || !fresh;
     if refreshed {
         let refresh = meta_string(credential, "refresh_token");
         if refresh.is_empty() {
@@ -743,12 +781,12 @@ pub(crate) async fn prepare(
     // A refresh already tried the lookup (ensureAntigravityProjectID, failure logged);
     // PrepareRequestAuth then looks again and reports its own outcome.
     let mut project = lookup(access.clone()).await;
-    if refreshed {
+    if refreshed && !force_refresh {
         match &project {
             Ok(found) if !found.is_empty() => {}
             Ok(_) => project = lookup(access.clone()).await,
             Err(error) => {
-                tracing::warn!("antigravity executor: ensure project id failed: {error}");
+                tracing::warn!(status = error.status, "antigravity executor: ensure project id failed");
                 project = lookup(access.clone()).await;
             }
         }
@@ -756,6 +794,16 @@ pub(crate) async fn prepare(
     match project {
         Ok(project) if !project.is_empty() => {
             patch.set.insert("project_id".into(), Value::String(project));
+            Ok(patch)
+        }
+        // Token rotation has already consumed the grant. Publish it before the next
+        // project-only preparation, which can report its failure without losing tokens.
+        // This intentionally differs from Go PrepareRequestAuth's all-or-error result.
+        result if refreshed => {
+            tracing::warn!(
+                status = result.err().and_then(|error| error.status),
+                "antigravity project discovery failed after token rotation; retaining rotated tokens"
+            );
             Ok(patch)
         }
         Ok(_) => Err(missing_project(None)),
@@ -971,7 +1019,11 @@ pub async fn login(auth_dir: &Path, cfg: &Config, options: &LoginOptions) -> Res
                 .and_then(serde_yaml_ng::Value::as_str)
                 .unwrap_or_default(),
         );
-        let oauth = OAuth::new(GoClients::new(Default::default()).get(&proxy));
+        let oauth = OAuth::new(
+            GoClients::new(Default::default())
+                .get_checked(&proxy)
+                .map_err(|error| String::from_utf8_lossy(&error.body).into_owned())?,
+        );
         let (file_name, metadata) = complete(&oauth, &callback.code, &redirect, Utc::now())
             .await
             .map_err(|e| e.message)?;
@@ -985,7 +1037,10 @@ pub async fn login(auth_dir: &Path, cfg: &Config, options: &LoginOptions) -> Res
             .and_then(Value::as_str)
             .unwrap_or("antigravity")
             .to_owned();
-        let path = write_login(auth_dir, &file_name, &metadata)?;
+        let auth_dir = auth_dir.to_owned();
+        let path = tokio::task::spawn_blocking(move || write_login(&auth_dir, &file_name, &metadata))
+            .await
+            .map_err(|_| "antigravity: credential publication failed".to_owned())??;
         Ok((path, label))
     }
     .await;

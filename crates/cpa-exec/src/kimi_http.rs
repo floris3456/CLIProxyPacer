@@ -280,6 +280,10 @@ pub fn expiration(credential: &Credential) -> Option<DateTime<Utc>> {
         .filter(|s| !s.is_empty())
         .or_else(|| credential.str("accessToken"))
         .unwrap_or_default();
+    token_expiration(token, credential)
+}
+
+pub(crate) fn token_expiration(token: &str, credential: &Credential) -> Option<DateTime<Utc>> {
     jwt_exp(token).or_else(|| expiration_from_map(&credential.metadata))
 }
 

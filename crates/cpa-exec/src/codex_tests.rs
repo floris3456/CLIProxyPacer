@@ -24,6 +24,7 @@ fn credential(case: &Value, base_url: &str) -> Credential {
         attributes: Default::default(),
         metadata: Default::default(),
         revision: 0,
+        parsed_by_plugin: false,
         next_refresh_after: None,
     });
     credential.provider = "codex".into();

@@ -1087,7 +1087,7 @@ impl CodexExecutor {
             Ok(Route {
                 client: self
                     .transport
-                    .for_url(next.as_str(), &view.proxy, view.chatgpt_keep_alive, view.handshake),
+                    .for_url(next.as_str(), &view.proxy, view.chatgpt_keep_alive, view.handshake)?,
                 order: None,
             })
         };
@@ -1144,6 +1144,7 @@ impl CodexExecutor {
         let builder = self
             .transport
             .standard(&view.proxy)
+            .map_err(|_| fail("could not create Codex upstream transport"))?
             .websocket(url)
             .headers(map)
             .max_frame_size(MAX_WS_MESSAGE)

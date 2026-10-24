@@ -3,8 +3,9 @@
 //! Gemini-family models reject a function-call history whose native thought signatures
 //! or call identities a client dropped or rewrote. After each completed turn the
 //! executor records the turn's signatures and native function calls (`Accumulator`,
-//! committed into `cpa_common::cache`'s replay cache per model and session). Before the
-//! next request, `prepare` restores them into the matching parts of the history. A
+//! committed into `cpa_common::cache`'s replay cache per caller, credential, model and
+//! session). Before the next request, `prepare` restores them into the matching parts
+//! of the history. A
 //! signature finds its part by the part's text hash or, for legacy items, by position
 //! under an unchanged context fingerprint. A native call is found by its ID, its
 //! Claude-facing provenance ID, or its name and arguments.
@@ -23,6 +24,7 @@ use cpa_common::cache::{self, MAX_REPLAY_BYTES, MAX_REPLAY_ITEMS, ReplaySnapshot
 use cpa_common::gostr::{GoStr, lower_bytes, trim_space};
 use cpa_common::json::{self as gj, AnyValue, GoValue, Kind, Res};
 use cpa_common::signature as sig;
+use cpa_core::credential::Credential;
 use cpa_core::exec::{ExecError, ExecRequest, ExecStream};
 use cpa_core::format::Format;
 use futures_util::StreamExt;
@@ -240,6 +242,36 @@ impl Scope {
 
     fn clear(&self) {
         cache::replay_delete_if_unchanged(&self.model, &self.session, &self.snapshot);
+    }
+
+    /// Session IDs and history hashes are client-controlled. Bind the ledger to the
+    /// authenticated caller and the selected upstream account before reading or
+    /// writing it. Never derive this boundary from request headers or JSON metadata.
+    fn isolated(mut self, req: &ExecRequest, credential: &Credential) -> Self {
+        if !self.valid() || credential.id.is_empty() {
+            return Self::default();
+        }
+        let endpoint = ag::base_url(credential);
+        let mut digest = Sha256::new();
+        for field in [
+            "antigravity-replay-scope-v1",
+            req.caller.provider.as_str(),
+            req.caller.principal.as_str(),
+            credential.provider.as_str(),
+            credential.id.as_str(),
+            credential.str("email").unwrap_or_default(),
+            crate::antigravity_auth::project_id(credential),
+            endpoint.as_str(),
+            self.session.as_str(),
+        ] {
+            digest.update((field.len() as u64).to_be_bytes());
+            digest.update(field.as_bytes());
+        }
+        // Access/refresh tokens and credential revisions rotate within one account;
+        // including them would discard valid reasoning history after each refresh.
+        // Only this digest is kept in the cache key, never a caller key or token.
+        self.session = format!("isolated:v1:{}", hex(&digest.finalize()));
+        self
     }
 }
 
@@ -1333,11 +1365,16 @@ fn apply_items(payload: &[u8], items: &[Vec<u8>], schemas: &Schemas) -> Option<V
 /// ledger's signatures and native calls restored, then the cache-independent history
 /// repairs and Go's pairing check. A pairing that only replay broke clears the ledger
 /// and sends the original payload; any other broken pairing is a 400 (`Err`).
-pub(crate) fn prepare(req: &ExecRequest, model: &str, payload: Vec<u8>) -> Result<(Vec<u8>, Scope), String> {
+pub(crate) fn prepare(
+    credential: &Credential,
+    req: &ExecRequest,
+    model: &str,
+    payload: Vec<u8>,
+) -> Result<(Vec<u8>, Scope), String> {
     if !ag::uses_reasoning_replay(model) {
         return Ok((payload, Scope::default()));
     }
-    let mut scope = scope_from_request(req, model, &payload);
+    let mut scope = scope_from_request(req, model, &payload).isolated(req, credential);
     let mut replayed = None;
     if scope.valid() {
         let (items, snapshot) = cache::replay_get_with_snapshot(&scope.model, &scope.session);

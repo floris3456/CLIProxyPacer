@@ -5,7 +5,8 @@
 //!   `requests.proxy-url`), parsed like `proxyutil.Parse`.
 //! - [`GoClients`]: clients keyed by effective proxy in a bounded 64-entry LRU, with
 //!   Go's standard-transport proxy rules (empty inherits environment proxies, `direct`
-//!   and `none` bypass them, an unusable URL falls back to the default transport).
+//!   and `none` bypass them). [`Proxy::validate`] and [`GoClients::get_checked`]
+//!   reject explicit unusable proxy settings before provider traffic can escape directly.
 //! - [`send`] and [`GoHeaders`]: one exchange the way `http.Client.Do` performs it:
 //!   HTTP/1.1 header line order, custom Host, manual redirects with Referer and
 //!   credential stripping, and transparent gzip only when Go would have asked for it.
@@ -90,6 +91,28 @@ impl Proxy {
     /// Credential `proxy_url` (attribute, then file metadata), then `requests.proxy-url`.
     pub fn effective(credential: &Credential, cfg: &Config) -> Self {
         Self::parse(&Self::effective_url(credential, cfg))
+    }
+
+    /// Rejects an explicit unusable route instead of silently inheriting another
+    /// transport. The error never includes the proxy URL or its credentials.
+    pub fn validate(&self) -> Result<(), ExecError> {
+        let invalid = || ExecError::local(502, FailureScope::Transport, "invalid upstream proxy configuration");
+        match self {
+            Self::Inherit | Self::Direct => Ok(()),
+            Self::Invalid => Err(invalid()),
+            Self::Url(raw) => {
+                let parsed = url::Url::parse(raw).map_err(|_| invalid())?;
+                if parsed.host_str().is_none_or(str::is_empty)
+                    || !matches!(parsed.scheme(), "http" | "https" | "socks5" | "socks5h")
+                    || parsed.port() == Some(0)
+                {
+                    return Err(invalid());
+                }
+                wreq::Proxy::all(wreq_proxy_url(raw).as_str())
+                    .map(|_| ())
+                    .map_err(|_| invalid())
+            }
+        }
     }
 
     /// The setting `effective` parses, trimmed (Go `proxyURLForAuth`).
@@ -320,6 +343,22 @@ impl GoClients {
         })
     }
 
+    /// A provider client that must honor its configured route. Unlike [`Self::get`],
+    /// neither an invalid setting nor a client-construction error permits direct fallback.
+    pub fn get_checked(&self, proxy: &Proxy) -> Result<wreq::Client, ExecError> {
+        proxy.validate()?;
+        if let (Some(default), Proxy::Inherit) = (&self.default, proxy) {
+            return Ok(default.clone());
+        }
+        self.try_get(proxy).ok_or_else(|| {
+            ExecError::local(
+                502,
+                FailureScope::Transport,
+                "could not create upstream proxy transport",
+            )
+        })
+    }
+
     /// The client for exactly `proxy`, or `None` when it cannot be built; never falls
     /// back to another transport (management `api-call` applies Go's own fallbacks).
     pub fn try_get(&self, proxy: &Proxy) -> Option<wreq::Client> {
@@ -462,6 +501,27 @@ impl GoHeaders {
         first
     }
 
+    /// Raw header names can have any casing. Crossing an origin must strip provider
+    /// credentials and account selectors regardless of the spelling used on the wire.
+    fn strip_redirect_credentials(&mut self) {
+        const SENSITIVE: &[&str] = &[
+            "authorization",
+            "www-authenticate",
+            "cookie",
+            "cookie2",
+            "proxy-authorization",
+            "proxy-authenticate",
+            "x-api-key",
+            "api-key",
+            "x-goog-api-key",
+            "chatgpt-account-id",
+            "openai-organization",
+            "openai-project",
+        ];
+        self.headers
+            .retain(|(name, _)| !SENSITIVE.iter().any(|sensitive| name.eq_ignore_ascii_case(sensitive)));
+    }
+
     /// Applies the headers with their wire spelling. `order` is an exact header order
     /// (Claude's ordered request writer); `None` writes Go net/http's order. Returns
     /// whether the transport asked for gzip itself (no explicit Accept-Encoding or
@@ -569,7 +629,7 @@ fn body_error(_: std::io::Error) -> ExecError {
 /// POSTs `body` the way Go's `http.Client.Do` does, following redirects itself: at
 /// most ten requests, 301/302/303 turn a POST into a body-less GET, 307/308 resend the
 /// body, the initial headers are copied to every hop (credentials only within the
-/// original domain), a custom Host survives only relative redirects, and the previous
+/// original origin), a custom Host survives only relative redirects, and the previous
 /// URL becomes `Referer`. `timeout` bounds the exchange.
 pub async fn send(
     client: &wreq::Client,
@@ -931,11 +991,7 @@ async fn exchange(
         }
         .map_err(|_| {
             local(
-                ExecError::local(
-                    500,
-                    FailureScope::Transport,
-                    format!("failed to parse Location header {location:?}"),
-                ),
+                ExecError::local(500, FailureScope::Transport, "failed to parse redirect Location header"),
                 &hop_url,
             )
         })?;
@@ -952,29 +1008,13 @@ async fn exchange(
                 method = wreq::Method::GET;
             }
         }
-        if !strip_sensitive && initial.host_str() != next.host_str() {
-            let (sub, parent) = (
-                next.host_str().unwrap_or_default(),
-                initial.host_str().unwrap_or_default(),
-            );
-            let subdomain = !sub.contains([':', '%'])
-                && sub.len() > parent.len()
-                && sub.ends_with(parent)
-                && sub.as_bytes()[sub.len() - parent.len() - 1] == b'.';
-            strip_sensitive = sub != parent && !subdomain;
-        }
+        // Deliberately stricter than Go's domain/subdomain rule: a different port,
+        // subdomain or HTTPS downgrade is a different recipient for credentials.
+        // Once removed, credentials stay removed even if a later hop returns home.
+        strip_sensitive |= initial.origin() != next.origin();
         hop_headers = headers.clone();
         if strip_sensitive {
-            for name in [
-                "Authorization",
-                "Www-Authenticate",
-                "Cookie",
-                "Cookie2",
-                "Proxy-Authorization",
-                "Proxy-Authenticate",
-            ] {
-                hop_headers.take(name);
-            }
+            hop_headers.strip_redirect_credentials();
         }
         if !include_body {
             for name in [
@@ -1535,6 +1575,36 @@ mod tests {
     }
 
     #[test]
+    fn checked_proxies_reject_invalid_routes_without_echoing_credentials() {
+        let clients = GoClients::with_default(wreq::Client::new());
+        for raw in [
+            "not a proxy",
+            "ftp://user:proxy-secret@proxy.invalid:21",
+            "http://user:proxy-secret@proxy.invalid:0",
+            "http://user:proxy-secret@proxy.invalid:70000",
+        ] {
+            let error = Proxy::parse(raw).validate().unwrap_err();
+            assert_eq!(error.status, 502);
+            assert_eq!(error.scope, FailureScope::Transport);
+            assert_eq!(&error.body[..], b"invalid upstream proxy configuration");
+            assert!(clients.get_checked(&Proxy::parse(raw)).is_err());
+            // A manually constructed Url must receive the same checks.
+            assert!(clients.get_checked(&Proxy::Url(raw.into())).is_err());
+        }
+        for raw in [
+            "",
+            "direct",
+            "none",
+            "http://proxy.invalid:8080",
+            "socks5://user:pass@proxy.invalid:1080",
+        ] {
+            Proxy::parse(raw).validate().unwrap();
+        }
+        assert!(clients.get_checked(&Proxy::Inherit).is_ok());
+        assert!(clients.get_checked(&Proxy::Direct).is_ok());
+    }
+
+    #[test]
     fn effective_proxy_precedence() {
         let cfg = Config::parse("requests:\n  proxy-url: http://global:1\n").unwrap();
         let mut c = Credential::from_file(
@@ -1936,6 +2006,176 @@ mod tests {
         ] {
             assert_eq!(go_resolve_path(base, reference), want, "{base:?} + {reference:?}");
         }
+    }
+
+    #[tokio::test]
+    async fn redirects_strip_raw_provider_secrets_and_never_restore_them() {
+        use crate::codex_testkit::{Mock, Reply, json};
+
+        let origin = Mock::start().await;
+        let foreign = Mock::start().await;
+        let redirect = |location: String| Reply {
+            status: 307,
+            headers: vec![("Location".into(), location)],
+            body: String::new(),
+        };
+        // Same hostname, different port: Go would retain Authorization here.
+        origin.script("/start", vec![redirect(format!("{}/hop", foreign.url))]);
+        foreign.script("/hop", vec![redirect(format!("{}/finish", origin.url))]);
+        origin.script("/finish", vec![json(200, "ok")]);
+        let secrets = [
+            "authorization",
+            "cOoKiE",
+            "Cookie2",
+            "PROXY-AUTHORIZATION",
+            "X-aPi-Key",
+            "api-key",
+            "X-Goog-Api-Key",
+            "Chatgpt-Account-Id",
+            "OpenAI-Organization",
+            "OpenAI-Project",
+        ];
+        let mut headers = GoHeaders::new();
+        for name in secrets {
+            headers.add_raw(name, "secret-for-original-origin");
+        }
+        headers.set("X-Request-Id", "safe-to-forward");
+        let client = GoClients::new(Hooks::default()).get_checked(&Proxy::Direct).unwrap();
+        let response = send(&client, &format!("{}/start", origin.url), headers, "body", None)
+            .await
+            .unwrap();
+        assert_eq!(response.status, 200);
+        let original = origin.take();
+        let redirected = foreign.take();
+        assert_eq!(original.len(), 2);
+        assert_eq!(redirected.len(), 1);
+        for name in secrets {
+            assert_eq!(original[0].header(name), "secret-for-original-origin");
+            assert_eq!(redirected[0].header(name), "", "foreign origin received {name}");
+            assert_eq!(original[1].header(name), "", "return hop restored {name}");
+        }
+        for hop in [&redirected[0], &original[1]] {
+            assert_eq!(hop.header("X-Request-Id"), "safe-to-forward");
+            assert_eq!(hop.method, "POST");
+            assert_eq!(&hop.body[..], b"body", "307 retains ordinary request bodies");
+        }
+    }
+
+    #[tokio::test]
+    async fn redirects_keep_secrets_on_origin_but_not_its_subdomains() {
+        use crate::codex_testkit::{Mock, Reply, json};
+
+        let mock = Mock::start().await;
+        let address = mock.url.strip_prefix("http://").unwrap().parse::<SocketAddr>().unwrap();
+        let client = GoClients::new(Hooks {
+            trust: None,
+            resolve: vec![
+                ("provider.test.invalid".into(), address),
+                ("sub.provider.test.invalid".into(), address),
+            ],
+        })
+        .get_checked(&Proxy::Direct)
+        .unwrap();
+        for (location, keep) in [
+            ("/finish".to_owned(), true),
+            (
+                format!("http://sub.provider.test.invalid:{}/finish", address.port()),
+                false,
+            ),
+        ] {
+            mock.script(
+                "/start",
+                vec![Reply {
+                    status: 302,
+                    headers: vec![("Location".into(), location)],
+                    body: String::new(),
+                }],
+            );
+            mock.script("/finish", vec![json(200, "ok")]);
+            let mut headers = GoHeaders::new();
+            headers.add_raw("aUtHoRiZaTiOn", "Bearer origin-secret");
+            headers.set("X-Api-Key", "origin-key");
+            let response = request(
+                &client,
+                wreq::Method::GET,
+                &format!("http://provider.test.invalid:{}/start", address.port()),
+                headers,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            assert_eq!(response.status, 200);
+            let hops = mock.take();
+            assert_eq!(hops.len(), 2);
+            assert_eq!(
+                hops[1].header("authorization"),
+                if keep { "Bearer origin-secret" } else { "" }
+            );
+            assert_eq!(hops[1].header("x-api-key"), if keep { "origin-key" } else { "" });
+        }
+    }
+
+    #[tokio::test]
+    async fn https_redirect_cannot_send_credentials_to_plain_http() {
+        use crate::codex_testkit::{Mock, json};
+        use std::pin::Pin;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+        let sink = Mock::start().await;
+        sink.script("/finish", vec![json(200, "ok")]);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (ca, builder) = crate::test_tls::builder(&["localhost".into()]);
+        let acceptor = builder.build();
+        let destination = sink.url.replace("127.0.0.1", "localhost");
+        let serving = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let ssl = btls::ssl::Ssl::new(acceptor.context()).unwrap();
+            let mut socket = tokio_btls::SslStream::new(ssl, socket).unwrap();
+            Pin::new(&mut socket).accept().await.unwrap();
+            let mut socket = tokio::io::BufReader::new(socket);
+            let mut head = String::new();
+            loop {
+                let mut line = String::new();
+                assert!(socket.read_line(&mut line).await.unwrap() > 0);
+                if line == "\r\n" {
+                    break;
+                }
+                head.push_str(&line);
+            }
+            assert!(head.contains("Bearer secure-origin-secret"));
+            socket.write_all(format!(
+                "HTTP/1.1 302 Found\r\nLocation: {destination}/finish\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            ).as_bytes()).await.unwrap();
+            socket.flush().await.unwrap();
+        });
+        let client = GoClients::new(Hooks {
+            trust: Some(CertStore::from_pem_stack(ca).unwrap()),
+            resolve: vec![],
+        })
+        .get_checked(&Proxy::Direct)
+        .unwrap();
+        let mut headers = GoHeaders::new();
+        headers.set("Authorization", "Bearer secure-origin-secret");
+        headers.set("X-Api-Key", "secure-origin-key");
+        let response = request(
+            &client,
+            wreq::Method::GET,
+            &format!("https://localhost:{port}/start"),
+            headers,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status, 200);
+        serving.await.unwrap();
+        let hops = sink.take();
+        assert_eq!(hops.len(), 1);
+        assert_eq!(hops[0].header("authorization"), "");
+        assert_eq!(hops[0].header("x-api-key"), "");
+        assert_eq!(hops[0].header("referer"), "");
     }
 
     /// Go's `http.Client` redirect hops for GET and POST (tests/reference/proxy/main.go),

@@ -1260,6 +1260,13 @@ mod creds {
                 for entry in std::fs::read_dir(&auth).unwrap() {
                     let entry = entry.unwrap();
                     let data = std::fs::read(entry.path()).unwrap();
+                    // Native writes now leave shared-lock sidecars. They are not
+                    // credentials; every other file still matches the Go recording.
+                    if entry.file_name().to_string_lossy().ends_with(".json.lock") {
+                        assert!(entry.file_type().unwrap().is_file(), "{at}: lock file type");
+                        assert!(data.is_empty(), "{at}: credential lock must be empty");
+                        continue;
+                    }
                     let v = cpa_common::json::GoValue::parse_f64(&data)
                         .and_then(|v| serde_json::from_slice::<Value>(&v.marshal()).ok())
                         .unwrap_or_else(|| json!(format!("raw:{}", String::from_utf8_lossy(&data))));

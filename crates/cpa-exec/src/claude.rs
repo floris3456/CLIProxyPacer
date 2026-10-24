@@ -201,7 +201,16 @@ impl ClaudeExecutor {
         self.oauth.prepare(credential, &Proxy::effective(credential, cfg)).await
     }
 
+    /// A provider-rejected token must rotate even when its expiry is still valid
+    /// and missing identity would otherwise select profile-only preparation.
+    pub async fn prepare_forced(&self, credential: &Credential, cfg: &Config) -> Result<MetadataPatch, ExecError> {
+        self.oauth
+            .refresh_credential(credential, &Proxy::effective(credential, cfg))
+            .await
+    }
+
     fn native_client(&self, proxy: &Proxy, handshake: Option<std::time::Duration>) -> Result<wreq::Client, ExecError> {
+        proxy.validate()?;
         match &self.native {
             Native::Fixed(client) => Ok(client.clone()),
             Native::Transport(t) => t
@@ -548,6 +557,7 @@ impl ClaudeExecutor {
                 body = rebuild_mid_system(&body);
             }
             let body = sanitize_for_upstream(body, &ctx.base_model, ctx.is_compat);
+            let body = preserved_thinking_binding(body);
             let body = cloak::strip_prompt_cache_options(ctx.count_rules(&req, body, &original));
             return Ok(ExecResponse {
                 status: 200,
@@ -607,7 +617,7 @@ impl ClaudeExecutor {
                 }
             } else {
                 Route {
-                    client: self.go.get(&ctx.proxy),
+                    client: self.go.get_checked(&ctx.proxy)?,
                     order: None,
                 }
             })
@@ -914,6 +924,14 @@ struct Prepared {
     fast: bool,
 }
 
+struct WirePolicy {
+    cloak: bool,
+    uncloak: bool,
+    strict: bool,
+    words: Vec<String>,
+    cache_user_id: bool,
+}
+
 /// `config.NormalizeClaudeFingerprintProfile`: unknown values are the default ("").
 fn normalize_fingerprint_profile(raw: &str) -> &'static str {
     match raw.trim().go_lower().as_str() {
@@ -1062,7 +1080,7 @@ impl<'a> Ctx<'a> {
         } else {
             own
         };
-        let api_key_kind = attr("auth_kind") == "apikey";
+        let api_key_kind = cpa_core::registry::dynamic::is_api_key(credential);
         let bearer = oauth_token || (!api_key_kind && attr("api_key").trim().is_empty());
         let base = base_model(&req.model);
         // Go `cliproxyauth.ResolvedModelInfo(req)`, bound by dispatch per attempt.
@@ -1167,8 +1185,9 @@ impl<'a> Ctx<'a> {
         })
     }
 
-    /// `resolveClaudeWirePolicy`: (cloak, strict, sensitive words, cache user id).
-    fn wire_policy(&self, confirmed: bool) -> (bool, bool, Vec<String>, bool) {
+    /// `resolveClaudeWirePolicy`: an explicit opt-out strips the CLI identity only
+    /// on credentials that do not require the Claude Code OAuth fingerprint.
+    fn wire_policy(&self, confirmed: bool) -> WirePolicy {
         let attr = |k: &str| {
             let a = self.credential.attributes.get(k).map(|s| s.trim()).unwrap_or_default();
             if a.is_empty() {
@@ -1193,6 +1212,7 @@ impl<'a> Ctx<'a> {
         if !attr_mode.is_empty() {
             mode = attr_mode.clone();
         }
+        let mut explicit_mode = attr_mode.trim().go_lower();
         let base = self
             .credential
             .attributes
@@ -1203,6 +1223,7 @@ impl<'a> Ctx<'a> {
         if let Some(c) = &key_cloak {
             if !c.mode.trim().is_empty() {
                 mode = c.mode.trim().to_owned();
+                explicit_mode = mode.go_lower();
             }
             strict |= c.strict_mode;
             if !c.sensitive_words.is_empty() {
@@ -1214,15 +1235,22 @@ impl<'a> Ctx<'a> {
         }
         let configured =
             key_cloak.is_some() || !attr_mode.is_empty() || attr_strict || !attr_words.is_empty() || attr_cache;
-        let mut cloak = (self.cli_profile || configured) && !confirmed;
+        let uncloak = !self.cli_profile && matches!(explicit_mode.as_str(), "never" | "uncloak");
+        let mut cloak = (self.cli_profile || configured) && !confirmed && !uncloak;
         if !confirmed {
             match mode.trim().go_lower().as_str() {
                 "always" => cloak = true,
-                "never" => cloak = false,
+                "never" | "uncloak" => cloak = false,
                 _ => {}
             }
         }
-        (cloak, strict, words, cache)
+        WirePolicy {
+            cloak,
+            uncloak,
+            strict,
+            words,
+            cache_user_id: cache,
+        }
     }
 
     /// Go `derived_session_id` metadata, as the server's `session.Enrich` set it.
@@ -1244,7 +1272,15 @@ impl<'a> Ctx<'a> {
     ) -> Result<Prepared, ExecError> {
         let original = utf8(&req.original_body);
         let detection = detect::detect(&req.headers, &original, false, &self.settings);
-        let confirmed = detection.confirmed;
+        let WirePolicy {
+            cloak,
+            uncloak,
+            strict,
+            words,
+            cache_user_id,
+        } = self.wire_policy(detection.confirmed);
+        let confirmed = detection.confirmed && !uncloak;
+        let helper = detection.helper_profile && !uncloak;
         let derived = self.derived_session(req);
         let translated = utf8(translated).into_owned();
         let session_id = if self.cli_profile {
@@ -1267,7 +1303,9 @@ impl<'a> Ctx<'a> {
         if self.rebuild_mid_system() {
             body = rebuild_mid_system(&body);
         }
-        let (cloak, strict, words, cache_user_id) = self.wire_policy(confirmed);
+        if uncloak {
+            body = uncloak_payload(&body, detection.confirmed);
+        }
         let cch = signing::enabled(&self.api_key, self.cli_profile, self.first_party);
         // v8.0.27 (eb6a768): the caller owns every breakpoint in explicit cache mode.
         let explicit = cloak::explicit_cache_mode(&[&original, &utf8(&req.body), &body]);
@@ -1351,7 +1389,7 @@ impl<'a> Ctx<'a> {
                 body = updated;
                 injected_cm = true;
             }
-            if self.cli_profile && !probe {
+            if self.cli_profile && !probe && self.settings.header_defaults.inject_diagnostics != Some(false) {
                 if !continuity.initialized {
                     let begun = session::begin(&self.continuity_identity(), &session_id, false, "");
                     diagnostics = begun;
@@ -1385,7 +1423,7 @@ impl<'a> Ctx<'a> {
         }
         // Execute only: ExecuteStream forwards the body's own `stream` field.
         let stream_field = rawjson::get(&body, "stream");
-        if !req.stream && (!detection.helper_profile || stream_field.exists() || upstream_stream) {
+        if !req.stream && (!helper || stream_field.exists() || upstream_stream) {
             let want = if upstream_stream { "true" } else { "false" };
             if stream_field.json() != want {
                 body = rawjson::set_raw(&body, "stream", want);
@@ -1421,7 +1459,7 @@ impl<'a> Ctx<'a> {
             body = m.obfuscate(&body);
         }
         if cch {
-            let fallback = if !detection.helper_profile || rawjson::get(&body, "system").exists() {
+            let fallback = if !helper || rawjson::get(&body, "system").exists() {
                 self.fallback_billing(&req.headers, &body, &detection.entrypoint, &continuity, confirmed)
             } else {
                 String::new()
@@ -1435,6 +1473,7 @@ impl<'a> Ctx<'a> {
         if self.compaction_summary {
             body = compaction::finalize(body);
         }
+        body = preserved_thinking_binding(body);
         // 868e137: the payload rules match the fully prepared body and apply once. Only
         // header extraction, signing and read-only checks follow.
         let (edited, touched) = cpa_common::payload::apply_tracked(
@@ -1473,9 +1512,10 @@ impl<'a> Ctx<'a> {
                 upstream_stream,
                 false,
                 confirmed && !cloaked,
-                detection.helper_profile,
+                helper,
                 &session_id,
                 cloaked,
+                uncloak,
             )
             .await?;
         let fast = fast
@@ -1522,7 +1562,14 @@ impl<'a> Ctx<'a> {
     ) -> Result<Prepared, ExecError> {
         let original = utf8(&req.original_body);
         let detection = detect::detect(&req.headers, &original, true, &self.settings);
-        let confirmed = detection.confirmed;
+        let WirePolicy {
+            cloak,
+            uncloak,
+            strict,
+            words,
+            ..
+        } = self.wire_policy(detection.confirmed);
+        let confirmed = detection.confirmed && !uncloak;
         let session_id = if self.cli_profile {
             let derived = self.derived_session(req);
             session::agent_session_uuid(
@@ -1544,7 +1591,9 @@ impl<'a> Ctx<'a> {
         if self.rebuild_mid_system() {
             body = rebuild_mid_system(&body);
         }
-        let (cloak, strict, words, _) = self.wire_policy(confirmed);
+        if uncloak {
+            body = uncloak_payload(&body, detection.confirmed);
+        }
         let explicit = cloak::explicit_cache_mode(&[&original, &utf8(&req.body), &body]);
         if cloak {
             if !strict && let Some(message) = cloak::invalid_system_block(&body) {
@@ -1571,6 +1620,7 @@ impl<'a> Ctx<'a> {
             body = alias::remap(&body, secret).0;
         }
         body = sanitize_for_upstream(body, &self.base_model, self.is_compat);
+        body = preserved_thinking_binding(body);
         body = cloak::strip_prompt_cache_options(body);
         if self.first_party || self.cli_profile {
             for field in ["metadata", "context_management", "diagnostics"] {
@@ -1593,6 +1643,7 @@ impl<'a> Ctx<'a> {
                 false,
                 &session_id,
                 cloak,
+                uncloak,
             )
             .await?;
         Ok(Prepared {
@@ -1618,6 +1669,7 @@ impl<'a> Ctx<'a> {
         helper: bool,
         session_id: &str,
         cloak: bool,
+        uncloak: bool,
     ) -> Result<(Vec<(String, String)>, Vec<String>), ExecError> {
         let cpa_session = cpa_common::session::cpa_session_id(req.session.as_deref()).unwrap_or_default();
         // Only a fingerprinted request replaces the caller's identity; an API key without
@@ -1655,6 +1707,7 @@ impl<'a> Ctx<'a> {
             incoming: &req.headers,
             confirmed,
             helper,
+            uncloak,
             cli_fingerprint: self.cli_profile || cloak,
             use_oauth_betas: self.cli_profile,
             session_id,
@@ -1905,6 +1958,60 @@ fn disable_thinking_if_tool_choice_forced(body: String) -> String {
     body
 }
 
+/// Go `applyClaudePreservedThinkingBinding`: replay the blocks unchanged, but let
+/// Anthropic drop prefix-bound history on a mismatch instead of rejecting the turn.
+/// Caller choices and the payload rules applied after this helper keep precedence.
+fn preserved_thinking_binding(mut body: String) -> String {
+    let model = cloak::canonical_model(rawjson::get(&body, "model").str());
+    let variant = |name: &str| {
+        model == name
+            || model
+                .strip_prefix(name)
+                .is_some_and(|suffix| suffix.starts_with('-') || suffix.starts_with('['))
+    };
+    let adaptive_only = variant("claude-sonnet-5-5") || variant("claude-haiku-5-5") || variant("claude-haiku-5.5");
+    let fable = ["fable-5-1", "fable-5.1"].iter().any(|name| {
+        model.find(name).is_some_and(|start| {
+            model
+                .as_bytes()
+                .get(start + name.len())
+                .is_none_or(|b| !b.is_ascii_digit())
+        })
+    });
+    let preserved = adaptive_only || model == "claude-opus-5-5" || model.starts_with("claude-opus-5-5[") || fable;
+    if !preserved || matches!(rawjson::get(&body, "tool_choice.type").str(), "any" | "tool") {
+        return body;
+    }
+    let thinking = rawjson::get(&body, "thinking");
+    if thinking.exists() {
+        let mode = thinking.get("type").str().trim().go_lower();
+        if !(mode == "adaptive" || (mode == "enabled" && !adaptive_only))
+            || thinking.get("block_binding.prefix_mismatch_behavior").exists()
+        {
+            return body;
+        }
+    }
+    let mut signed_history = false;
+    rawjson::get(&body, "messages").each_value(|message| {
+        message.get("content").each_value(|block| {
+            signed_history = match block.get("type").str().trim() {
+                "thinking" => !block.get("signature").str().trim().is_empty(),
+                "redacted_thinking" => !block.get("data").str().trim().is_empty(),
+                _ => false,
+            };
+            !signed_history
+        });
+        !signed_history
+    });
+    if !signed_history {
+        return body;
+    }
+    if !thinking.exists() {
+        body = rawjson::set_str(&body, "thinking.type", "adaptive");
+    }
+    rawjson::set_str(&body, "thinking.block_binding.prefix_mismatch_behavior", "drop_block")
+}
+
 /// `normalizeClaudeSamplingForUpstream`.
 fn normalize_sampling(mut body: String, native: bool) -> String {
     let thinking = matches!(
@@ -2007,15 +2114,18 @@ fn system_text_parts(content: &rawjson::Value<'_>) -> Vec<String> {
 
 /// `util.StripClaudeCodeAttributionSystem`.
 fn strip_attribution_system(body: &str) -> String {
+    strip_system_blocks(body, |t| t.trim_start().starts_with(cloak::BILLING_PREFIX))
+}
+
+fn strip_system_blocks(body: &str, remove: impl Fn(&str) -> bool) -> String {
     let system = rawjson::get(body, "system");
-    let attribution = |t: &str| t.trim_start().starts_with(cloak::BILLING_PREFIX);
     match system.kind() {
-        gjson::Kind::String if attribution(system.str()) => rawjson::delete(body, "system"),
+        gjson::Kind::String if remove(system.str()) => rawjson::delete(body, "system"),
         gjson::Kind::Array => {
             let blocks = system.array();
             let kept: Vec<String> = blocks
                 .iter()
-                .filter(|b| !(b.get("type").str() == "text" && attribution(b.get("text").str())))
+                .filter(|b| !(b.get("type").str() == "text" && remove(b.get("text").str())))
                 .map(|b| b.json().to_owned())
                 .collect();
             if kept.len() == blocks.len() {
@@ -2028,6 +2138,31 @@ fn strip_attribution_system(body: &str) -> String {
         }
         _ => body.to_owned(),
     }
+}
+
+/// Remove only recognized Claude Code attribution, preserving application prompts
+/// and unrelated metadata byte for byte. Real OAuth/CLI-profile credentials never
+/// take this path: they still need their selected-account identity upstream.
+fn uncloak_payload(body: &str, confirmed: bool) -> String {
+    let mut body = strip_system_blocks(body, |text| {
+        text.trim_start().starts_with(cloak::BILLING_PREFIX) || cloak::is_cli_identity(text)
+    });
+    let metadata = rawjson::get(&body, "metadata");
+    let user_id = metadata.get("user_id");
+    if metadata.kind() == gjson::Kind::Object
+        && user_id.exists()
+        && (confirmed || (user_id.kind() == gjson::Kind::String && detect::valid_user_id(user_id.str())))
+    {
+        body = rawjson::delete(&body, "metadata.user_id");
+        if rawjson::get(&body, "metadata").values().is_empty() {
+            body = rawjson::delete(&body, "metadata");
+        }
+    }
+    let diagnostics = rawjson::get(&body, "diagnostics");
+    if diagnostics.exists() && (confirmed || diagnostics.get("previous_message_id").exists()) {
+        body = rawjson::delete(&body, "diagnostics");
+    }
+    body
 }
 
 #[cfg(test)]

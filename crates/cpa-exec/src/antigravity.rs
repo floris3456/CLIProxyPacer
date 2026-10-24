@@ -264,7 +264,27 @@ impl AntigravityExecutor {
     /// Credential preparation, then Go's post-refresh credits lookup
     /// (`queueAntigravityCreditsRefresh` after `refreshToken`).
     pub async fn prepare(&self, credential: &Credential, cfg: &Config) -> Result<MetadataPatch, ExecError> {
-        let patch = auth::prepare(&self.clients_for(credential, cfg), credential, cfg).await?;
+        self.prepare_with(credential, cfg, false).await
+    }
+
+    /// A rejected token or explicit management refresh must rotate before project
+    /// discovery, even if its expiry still says it is fresh.
+    pub async fn prepare_forced(&self, credential: &Credential, cfg: &Config) -> Result<MetadataPatch, ExecError> {
+        self.prepare_with(credential, cfg, true).await
+    }
+
+    async fn prepare_with(
+        &self,
+        credential: &Credential,
+        cfg: &Config,
+        force_refresh: bool,
+    ) -> Result<MetadataPatch, ExecError> {
+        let clients = self.clients_for(credential, cfg);
+        let patch = if force_refresh {
+            auth::prepare_forced(&clients, credential, cfg).await?
+        } else {
+            auth::prepare(&clients, credential, cfg).await?
+        };
         if let Some(token) = patch.set.get("access_token").and_then(serde_json::Value::as_str) {
             let mut current = credential.clone();
             for (key, value) in &patch.set {
@@ -303,7 +323,14 @@ impl AntigravityExecutor {
             credits::end_refresh(&id);
             return;
         };
-        let client = self.client(credential, cfg);
+        let client = match self.client(credential, cfg) {
+            Ok(client) => client,
+            Err(_) => {
+                credits::end_refresh(&id);
+                tracing::warn!("antigravity credits refresh skipped: invalid proxy transport");
+                return;
+            }
+        };
         let url = format!(
             "{}/v1internal:loadCodeAssist",
             ag::load_code_assist_base_url(credential)
@@ -369,9 +396,9 @@ impl AntigravityExecutor {
             .retain(|(s, ..)| s != scope);
     }
 
-    fn client(&self, credential: &Credential, cfg: &Config) -> wreq::Client {
+    fn client(&self, credential: &Credential, cfg: &Config) -> Result<wreq::Client, ExecError> {
         self.clients_for(credential, cfg)
-            .get(&Proxy::effective(credential, cfg))
+            .get_checked(&Proxy::effective(credential, cfg))
     }
 
     /// `getSensitiveWordMatcher` for `antigravity.sensitive-words` (v8
@@ -550,7 +577,7 @@ impl AntigravityExecutor {
         {
             body = with_credits;
         }
-        let (body, replay) = replay::prepare(req, model, body).map_err(|e| gemini::status_err(400, e))?;
+        let (body, replay) = replay::prepare(credential, req, model, body).map_err(|e| gemini::status_err(400, e))?;
         let body = ag::ensure_boundary_user_content(model, body);
         Ok(Prepared {
             translated,
@@ -616,7 +643,7 @@ impl AntigravityExecutor {
         headers.set("Authorization", format!("Bearer {token}"));
         headers.set("User-Agent", ag::user_agent(credential));
         gemini::set_custom_headers(&mut headers, credential, req);
-        let client = self.client(credential, cfg);
+        let client = self.client(credential, cfg)?;
         gemini::send_captured(
             req.capture(),
             credential,
@@ -784,7 +811,7 @@ impl AntigravityExecutor {
         lines = gemini::antigravity_payloads(lines);
         if ag::resolves_grounding_urls(req.source_format, &req.body, &prepared.translated) {
             let resolver = Grounding {
-                client: self.plain.get(&Proxy::effective(credential, cfg)),
+                client: self.plain.get_checked(&Proxy::effective(credential, cfg))?,
             };
             lines = lines
                 .then(move |item| {
@@ -826,9 +853,11 @@ impl AntigravityExecutor {
         if !ag::resolves_grounding_urls(from, &req.body, translated) {
             return body;
         }
-        let resolver = Grounding {
-            client: self.plain.get(&Proxy::effective(credential, cfg)),
+        let Ok(client) = self.plain.get_checked(&Proxy::effective(credential, cfg)) else {
+            tracing::warn!("antigravity grounding lookup skipped: invalid proxy transport");
+            return body;
         };
+        let resolver = Grounding { client };
         resolver.payload(body).await
     }
 
@@ -912,7 +941,7 @@ impl AntigravityExecutor {
             body = ag::obfuscate_system_instruction(body, |text| matcher.obfuscate(text));
         }
         body = ag::sanitize_gemini_signatures(&model, body);
-        body = replay::prepare(&req, &model, body)
+        body = replay::prepare(credential, &req, &model, body)
             .map_err(|e| gemini::status_err(400, e))?
             .0;
         body = ag::ensure_leading_user_content(&model, body);
@@ -936,7 +965,7 @@ impl AntigravityExecutor {
         headers.set("Authorization", format!("Bearer {token}"));
         headers.set("User-Agent", ag::user_agent(credential));
         gemini::set_custom_headers(&mut headers, credential, &req);
-        let client = self.client(credential, cfg);
+        let client = self.client(credential, cfg)?;
         let upstream = gemini::send_captured(
             req.capture(),
             credential,

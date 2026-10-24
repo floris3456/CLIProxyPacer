@@ -1171,7 +1171,7 @@ impl CodexExecutor {
         let key = offer_compression(&mut headers);
         let builder = self
             .transport
-            .standard(&target.proxy)
+            .standard(&target.proxy)?
             .websocket(&target.url)
             .headers(headers)
             .accept_key(key.clone());

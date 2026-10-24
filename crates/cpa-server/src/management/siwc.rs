@@ -432,10 +432,22 @@ pub(super) fn callback(state: &Arc<Management>, req: &CallbackRequest, query: Op
     }
     let (worker, task_flow) = (state.clone(), flow.clone());
     let task = tokio::spawn(async move {
+        let client = match super::oauth::login_client(&worker) {
+            Ok(client) => client,
+            Err(_) => {
+                fail_session(
+                    &worker,
+                    &sid,
+                    &task_flow,
+                    "SIWC token exchange failed: invalid proxy transport",
+                );
+                return;
+            }
+        };
         let oauth = match &worker.login_base {
-            Some(base) => cpa_exec::codex_oauth::CodexOAuth::new(super::oauth::login_client(&worker))
+            Some(base) => cpa_exec::codex_oauth::CodexOAuth::new(client)
                 .with_siwc_token_url(&format!("{base}/api/accounts/oauth/token")),
-            None => cpa_exec::codex_oauth::CodexOAuth::new(super::oauth::login_client(&worker)),
+            None => cpa_exec::codex_oauth::CodexOAuth::new(client),
         };
         let exchange = oauth.exchange_siwc(
             &code,
@@ -564,7 +576,7 @@ fn write_binding(state: &Management, flow: &Flow, tokens: &Tokens) -> Result<(),
             return Err("backing account changed".into());
         }
         let bytes = codex_siwc::bind_file(&disk, tokens).ok_or("invalid Codex OAuth file")?;
-        match super::auth_files::save_bytes(state, &current, bytes) {
+        match super::auth_files::save_bytes(state, &current, bytes, &disk) {
             Ok(()) => return Ok(()),
             Err(crate::runtime::PatchError::Stale { .. }) => continue,
             Err(e) => return Err(format!("{e:?}")),

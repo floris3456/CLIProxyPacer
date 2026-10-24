@@ -17,6 +17,7 @@
 
 use std::sync::Mutex;
 
+use cpa_core::exec::{ExecError, FailureScope};
 use wreq::tls::compress::{CertificateCompressionAlgorithm, CertificateCompressor, Codec};
 use wreq::tls::{AlpnProtocol, AlpsProtocol, KeyShare, TlsOptions, TlsVersion};
 
@@ -67,21 +68,22 @@ impl Transport {
         proxy: &Proxy,
         keep_alive: bool,
         handshake: Option<std::time::Duration>,
-    ) -> wreq::Client {
+    ) -> Result<wreq::Client, ExecError> {
         if is_chatgpt(url) {
             self.chrome(&(proxy.clone(), keep_alive, handshake))
         } else {
-            self.standard.get(proxy)
+            self.standard.get_checked(proxy)
         }
     }
 
     /// Go's standard transport (the WebSocket dialer honours environment proxies too).
-    pub fn standard(&self, proxy: &Proxy) -> wreq::Client {
-        self.standard.get(proxy)
+    pub fn standard(&self, proxy: &Proxy) -> Result<wreq::Client, ExecError> {
+        self.standard.get_checked(proxy)
     }
 
-    fn chrome(&self, key: &ChromeKey) -> wreq::Client {
+    fn chrome(&self, key: &ChromeKey) -> Result<wreq::Client, ExecError> {
         let (proxy, keep_alive, handshake) = key;
+        proxy.validate()?;
         let keep_alive = *keep_alive;
         let mut cache = self.chrome.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if !keep_alive {
@@ -94,16 +96,20 @@ impl Transport {
             let entry = cache.remove(i);
             let client = entry.1.clone();
             cache.insert(0, entry);
-            return client;
+            return Ok(client);
         }
-        // Go logs an unusable proxy dialer and dials directly.
-        let client = self
-            .build_chrome(proxy, keep_alive, *handshake)
-            .or_else(|_| self.build_chrome(&Proxy::Direct, keep_alive, *handshake))
-            .expect("Chrome TLS client");
+        // The configured route is an isolation boundary; a build failure must not
+        // expose the account through a direct connection.
+        let client = self.build_chrome(proxy, keep_alive, *handshake).map_err(|_| {
+            ExecError::local(
+                502,
+                FailureScope::Transport,
+                "could not create Codex upstream transport",
+            )
+        })?;
         cache.insert(0, (key.clone(), client.clone()));
         cache.truncate(CACHE_CAPACITY);
-        client
+        Ok(client)
     }
 
     fn build_chrome(

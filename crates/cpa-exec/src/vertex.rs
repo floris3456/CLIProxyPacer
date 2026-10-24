@@ -353,8 +353,8 @@ impl VertexExecutor {
         }
     }
 
-    fn client(&self, credential: &Credential, cfg: &Config) -> wreq::Client {
-        self.clients.get(&Proxy::effective(credential, cfg))
+    fn client(&self, credential: &Credential, cfg: &Config) -> Result<wreq::Client, ExecError> {
+        self.clients.get_checked(&Proxy::effective(credential, cfg))
     }
 
     pub async fn execute(
@@ -388,7 +388,7 @@ impl VertexExecutor {
             Auth::ApiKey { key, .. } => headers.set("x-goog-api-key", key.clone()),
             Auth::ServiceAccount { account, .. } => {
                 // Token exchange uses the credential's proxy, like the model request.
-                let token = vertex_auth::access_token(&self.client(credential, cfg), account, (self.now)())
+                let token = vertex_auth::access_token(&self.client(credential, cfg)?, account, (self.now)())
                     .await
                     .map_err(|error| {
                         tracing::error!(%error, "vertex executor: access token error");
@@ -472,7 +472,7 @@ impl VertexExecutor {
         check_url(&url)?;
         let headers = self.headers(credential, req, cfg, auth).await?;
         let capture = req.capture();
-        let client = self.client(credential, cfg);
+        let client = self.client(credential, cfg)?;
         let body = Bytes::from(body);
         let upstream = g::send_captured(
             capture,
@@ -551,7 +551,7 @@ impl VertexExecutor {
         check_url(&url)?;
         let headers = self.headers(credential, req, cfg, &auth).await?;
         let capture = req.capture();
-        let client = self.client(credential, cfg);
+        let client = self.client(credential, cfg)?;
         let body = Bytes::from(body);
         let upstream = g::send_captured(
             capture,

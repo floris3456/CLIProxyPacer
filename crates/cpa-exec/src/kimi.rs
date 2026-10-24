@@ -99,7 +99,11 @@ impl KimiExecutor {
         };
         let domain = kimi_auth::resolve_domain(credential);
         let device_id = credential.str("device_id").unwrap_or_default();
-        let mut flow = DeviceFlow::new(self.clients.get(&Proxy::effective(credential, cfg)), domain, device_id);
+        let mut flow = DeviceFlow::new(
+            self.clients.get_checked(&Proxy::effective(credential, cfg))?,
+            domain,
+            device_id,
+        );
         if let Some(host) = &self.oauth_host {
             flow = flow.with_oauth_host(host);
         }
@@ -129,7 +133,7 @@ impl KimiExecutor {
             }
             return self.execute_claude(claude, credential, req, cfg).await;
         }
-        let client = self.clients.get(&Proxy::effective(credential, cfg));
+        let client = self.clients.get_checked(&Proxy::effective(credential, cfg))?;
         if req.source_format == Format::OpenAIResponse {
             return execute_responses(&client, credential, req, cfg).await;
         }
@@ -144,6 +148,14 @@ impl KimiExecutor {
         cfg: &Config,
     ) -> Result<ExecResponse, ExecError> {
         let mut delegated = credential.clone();
+        // Every format selects the same Kimi token. Keep the API-key attribute's
+        // presence for Claude's auth classification; Kimi endpoints use Bearer either way.
+        let token = access_token(credential);
+        if let Some(key) = delegated.attributes.get_mut("api_key").filter(|key| !key.is_empty()) {
+            *key = token.to_owned();
+        } else {
+            delegated.metadata.insert("access_token".into(), token.into());
+        }
         delegated
             .attributes
             .insert("base_url".into(), claude_base_url(credential));
@@ -159,7 +171,7 @@ impl KimiExecutor {
         if req.operation == Operation::CountTokens {
             return claude.execute_delegated(&delegated, req, cfg, delegation).await;
         }
-        let scope = kimi_replay::prepare(&self.replay, &mut req).await;
+        let scope = kimi_replay::prepare(&self.replay, credential, &mut req).await;
         let streaming = req.stream;
         let mut response = match claude.execute_delegated(&delegated, req, cfg, delegation).await {
             Ok(response) => response,
@@ -237,14 +249,14 @@ fn claude_base_url(credential: &Credential) -> String {
 }
 
 /// `kimiCreds`: metadata access token, then attribute access token or API key.
-fn access_token(credential: &Credential) -> String {
+pub(crate) fn access_token(credential: &Credential) -> &str {
     if let Some(token) = credential.str("access_token").filter(|s| !s.trim().is_empty()) {
-        return token.to_owned();
+        return token;
     }
     ["access_token", "api_key"]
         .iter()
         .find_map(|k| credential.attributes.get(*k).filter(|s| !s.is_empty()))
-        .cloned()
+        .map(String::as_str)
         .unwrap_or_default()
 }
 

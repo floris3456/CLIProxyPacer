@@ -13,7 +13,7 @@ use http::HeaderMap;
 use super::betas::{self, Requested};
 use super::detect::{header, header_values};
 use super::profile::{self, Profile};
-use super::settings::Settings;
+use super::settings::{ClientRequestId, Settings};
 use super::signals;
 use crate::rawjson;
 
@@ -152,6 +152,8 @@ pub(crate) struct Plan<'a> {
     pub incoming: &'a HeaderMap,
     pub confirmed: bool,
     pub helper: bool,
+    /// Explicit never/uncloak on a credential without the CLI fingerprint.
+    pub uncloak: bool,
     /// `fp.ProfileClaudeCodeCLI || wirePolicy.Cloak`.
     pub cli_fingerprint: bool,
     pub use_oauth_betas: bool,
@@ -220,14 +222,14 @@ pub(crate) fn build(p: &Plan<'_>) -> GoHeader {
         if advisor {
             base = betas::with_advisor(&base);
         }
-        if p.use_oauth_betas && !p.helper {
+        if p.use_oauth_betas {
             if p.count_tokens {
                 base = betas::with_count_oauth(&base);
             } else {
                 let sub = signals::subagent(p.incoming, p.body);
                 let probe = signals::probe_or_helper(p.body);
                 let sub1h = sub && signals::subagent_requests_1h(p.incoming, p.body);
-                base = betas::with_oauth_credential(&base, (!sub || sub1h) && !probe);
+                base = betas::with_oauth_credential(&base, !p.helper && (!sub || sub1h) && !probe);
             }
         }
     } else if preserve_caller && p.use_oauth_betas {
@@ -287,6 +289,25 @@ pub(crate) fn build(p: &Plan<'_>) -> GoHeader {
     }
     let finalize_betas = |base: &str| -> String {
         let mut b = base.to_owned();
+        if p.uncloak {
+            for beta in [
+                betas::CLAUDE_CODE,
+                betas::OAUTH,
+                betas::REDACT_THINKING,
+                betas::AFK_MODE,
+            ] {
+                b = betas::without(&b, beta);
+            }
+            if !rawjson::get(p.body, "diagnostics").exists() {
+                b = betas::without(&b, betas::CACHE_DIAGNOSIS);
+            }
+            if !rawjson::get(p.body, "fallback_credit_token").exists() {
+                b = betas::without(&b, betas::FALLBACK_CREDIT);
+            }
+            if !signals::has_1h_ttl(p.body) {
+                b = betas::without(&b, betas::EXTENDED_CACHE_TTL);
+            }
+        }
         if !betas::supports_effort(p.body) {
             b = betas::without(&b, betas::EFFORT);
         }
@@ -313,6 +334,18 @@ pub(crate) fn build(p: &Plan<'_>) -> GoHeader {
         if model.contains("haiku") && !rawjson::get(p.body, "fallbacks").exists() && !p.helper {
             b = betas::without(&b, betas::SERVER_SIDE_FALLBACK);
         }
+        // Binding controls need their beta in caller-owned and native profiles too.
+        // Explicit header controls still run last and may strip it.
+        if rawjson::get(p.body, "thinking.block_binding").exists()
+            && !b.split(',').any(|beta| beta.trim() == betas::THINKING_BINDING)
+        {
+            if b.trim().is_empty() {
+                b.clear();
+            } else {
+                b.push(',');
+            }
+            b.push_str(betas::THINKING_BINDING);
+        }
         b
     };
     let apply_betas = |h: &mut GoHeader, b: &str| {
@@ -331,16 +364,16 @@ pub(crate) fn build(p: &Plan<'_>) -> GoHeader {
         } else {
             ("application/json", "gzip, deflate, br, zstd")
         };
-        copy_caller_fingerprint(&mut h, p.incoming, p.confirmed);
+        copy_caller_fingerprint(&mut h, p.incoming, p.confirmed, p.uncloak);
         ensure(&mut h, p.incoming, "Anthropic-Version", "2023-06-01");
         ensure(&mut h, p.incoming, "Accept", accept);
         ensure(&mut h, p.incoming, "Accept-Encoding", encoding);
-        ensure(
-            &mut h,
-            p.incoming,
-            "User-Agent",
-            &format!("CLIProxyAPI/{}", crate::claude::PROXY_VERSION),
-        );
+        let default_user_agent = format!("CLIProxyAPI/{}", crate::claude::PROXY_VERSION);
+        if p.uncloak && claude_user_agent(header(p.incoming, "user-agent")) {
+            h.set("User-Agent", default_user_agent);
+        } else {
+            ensure(&mut h, p.incoming, "User-Agent", &default_user_agent);
+        }
         apply_betas(&mut h, &base);
         if !p.session_id.trim().is_empty() {
             h.set("X-Claude-Code-Session-Id", p.session_id.trim());
@@ -363,6 +396,7 @@ pub(crate) fn build(p: &Plan<'_>) -> GoHeader {
         } else if p.stream {
             restore(&mut h);
         }
+        apply_header_controls(&mut h, p);
         return h;
     }
 
@@ -428,7 +462,16 @@ pub(crate) fn build(p: &Plan<'_>) -> GoHeader {
         }
     }
     if p.first_party || (p.helper && !header(p.incoming, "x-client-request-id").is_empty()) {
-        identity(&mut h, "x-client-request-id", &new_request_id());
+        match p.settings.header_defaults.client_request_id {
+            ClientRequestId::On => identity(&mut h, "x-client-request-id", &new_request_id()),
+            ClientRequestId::Passthrough => {
+                let incoming = header(p.incoming, "x-client-request-id");
+                if !incoming.is_empty() {
+                    h.set("x-client-request-id", incoming);
+                }
+            }
+            ClientRequestId::Off => {}
+        }
     }
     h.set("Connection", "keep-alive");
     let transport = |h: &mut GoHeader| {
@@ -463,7 +506,48 @@ pub(crate) fn build(p: &Plan<'_>) -> GoHeader {
     } else if p.stream {
         transport(&mut h);
     }
+    apply_header_controls(&mut h, p);
     h
+}
+
+/// Explicit controls apply to the emitted headers, including credential overrides.
+/// The default path does not allocate or walk the beta list again.
+fn apply_header_controls(h: &mut GoHeader, p: &Plan<'_>) {
+    let defaults = &p.settings.header_defaults;
+    if !defaults.anthropic_beta_strip.is_empty() || !defaults.anthropic_beta_append.is_empty() {
+        let stripped: std::collections::HashSet<&str> =
+            defaults.anthropic_beta_strip.iter().map(String::as_str).collect();
+        let mut betas: Vec<&str> = h
+            .get("Anthropic-Beta")
+            .split(',')
+            .map(str::trim)
+            .filter(|beta| !beta.is_empty() && !stripped.contains(beta))
+            .collect();
+        let mut present: std::collections::HashSet<&str> = betas.iter().copied().collect();
+        for beta in &defaults.anthropic_beta_append {
+            if present.insert(beta.as_str()) {
+                betas.push(beta);
+            }
+        }
+        let emitted = betas.join(",");
+        if emitted.is_empty() {
+            h.del("Anthropic-Beta");
+        } else {
+            h.set("Anthropic-Beta", emitted);
+        }
+    }
+    match defaults.client_request_id {
+        ClientRequestId::Off => h.del("x-client-request-id"),
+        ClientRequestId::Passthrough => {
+            let incoming = header(p.incoming, "x-client-request-id");
+            if incoming.is_empty() {
+                h.del("x-client-request-id");
+            } else if !h.get("x-client-request-id").is_empty() {
+                h.set("x-client-request-id", incoming);
+            }
+        }
+        ClientRequestId::On => {}
+    }
 }
 
 /// `ApplyClaudeLegacyDeviceHeaders` (device-profile stabilization off, the default).
@@ -497,10 +581,14 @@ fn legacy_device_headers(h: &mut GoHeader, p: &Plan<'_>) {
         // its User-Agent (docs/DIFFERENCES-FROM-GO.md); otherwise Go's baseline values.
         let newer = profile::newer_than_baseline(ua, p.settings);
         ensure_valid("X-Stainless-Runtime-Version", &d.runtime_version, &|v| {
-            v == d.runtime_version || (newer && profile::runtime_version_ok(v))
+            v == d.runtime_version
+                || (newer && profile::runtime_version_ok(v))
+                || (p.helper && profile::runtime_version_at_least(v, &d.runtime_version))
         });
         ensure_valid("X-Stainless-Package-Version", &d.package_version, &|v| {
-            v == d.package_version || (newer && profile::package_version_ok(v))
+            v == d.package_version
+                || (newer && profile::package_version_ok(v))
+                || (p.helper && profile::package_version_at_least(v, &d.package_version))
         });
         ensure_valid("X-Stainless-Os", &profile::host_os(), &|_| true);
         ensure_valid("X-Stainless-Arch", &profile::host_arch(), &|_| true);
@@ -517,7 +605,7 @@ fn legacy_device_headers(h: &mut GoHeader, p: &Plan<'_>) {
 }
 
 /// `copyClaudeCallerFingerprintHeaders`.
-fn copy_caller_fingerprint(h: &mut GoHeader, incoming: &HeaderMap, confirmed: bool) {
+fn copy_caller_fingerprint(h: &mut GoHeader, incoming: &HeaderMap, confirmed: bool, uncloak: bool) {
     for name in incoming.keys() {
         let n = name.as_str();
         let fingerprint = matches!(
@@ -536,11 +624,32 @@ fn copy_caller_fingerprint(h: &mut GoHeader, incoming: &HeaderMap, confirmed: bo
         if !fingerprint || (!confirmed && (n.starts_with("x-claude-code-") || n.starts_with("x-claude-remote-"))) {
             continue;
         }
+        if uncloak
+            && (matches!(
+                n,
+                "x-app"
+                    | "x-client-request-id"
+                    | "x-client-app"
+                    | "x-anthropic-additional-protection"
+                    | "anthropic-dangerous-direct-browser-access"
+            ) || n.starts_with("x-stainless-")
+                || n.starts_with("x-claude-code-")
+                || n.starts_with("x-claude-remote-")
+                || (n == "user-agent" && claude_user_agent(header(incoming, n))))
+        {
+            continue;
+        }
         h.del(n);
         for value in incoming.get_all(name).iter().filter_map(|v| v.to_str().ok()) {
             h.add(n, value);
         }
     }
+}
+
+fn claude_user_agent(value: &str) -> bool {
+    value
+        .get(..11)
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("claude-cli/"))
 }
 
 /// `util.ApplyCustomHeadersFromAttrs` through the shared `cpa_common::headers`.
@@ -648,6 +757,7 @@ mod tests {
             incoming: &incoming,
             confirmed: false,
             helper: false,
+            uncloak: false,
             cli_fingerprint: true,
             use_oauth_betas: true,
             session_id: "dd01238e-cdb5-5572-8f27-a28d98fe9075",
@@ -721,6 +831,7 @@ mod version_tests {
             incoming: &incoming,
             confirmed: true,
             helper: false,
+            uncloak: false,
             cli_fingerprint: true,
             use_oauth_betas: true,
             session_id: "dd01238e-cdb5-5572-8f27-a28d98fe9075",

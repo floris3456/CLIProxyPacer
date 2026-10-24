@@ -1,7 +1,8 @@
 //! Differential tests against `tests/fixtures/antigravity_replay_go.json`: every call
 //! Go's own reasoning replay tests (and their randomized differentials) make to the
 //! replay entry points, recorded with Go's results (tests/reference/antigravity_replay).
-//! Expected values come only from Go.
+//! Payload expectations come from Go. Cache namespaces deliberately add the trusted
+//! caller and selected credential; the isolation regressions below cover that boundary.
 
 use bytes::Bytes;
 use cpa_core::exec::{Caller, Operation};
@@ -28,6 +29,24 @@ fn strings(v: &Value) -> Vec<Vec<u8>> {
         .flatten()
         .map(|item| s(item).as_bytes().to_vec())
         .collect()
+}
+
+fn credential() -> Credential {
+    Credential::from_file(
+        std::path::Path::new("/fixture/auth"),
+        std::path::Path::new("/fixture/auth/replay-account.json"),
+        serde_json::json!({
+            "type": "antigravity",
+            "email": "replay@example.invalid",
+            "project_id": "replay-project",
+            "access_token": "test-access-token",
+            "refresh_token": "test-refresh-token"
+        })
+        .as_object()
+        .unwrap()
+        .clone(),
+    )
+    .unwrap()
 }
 
 /// The ExecRequest a Go (req, opts) pair maps to: `body` is `req.Payload`,
@@ -134,31 +153,145 @@ fn apply_matches_go() {
 
 #[test]
 fn prepare_matches_go() {
+    let credential = credential();
     let mut ran = 0;
     for r in records("prepare") {
         let test = s(&r["test"]);
         let model = s(&r["request"]["model"]);
-        let session = s(&r["session"]);
-        if !model.trim().is_empty() && !session.trim().is_empty() {
-            cache::replay_delete_if_unchanged(model, session, &ReplaySnapshot::default());
+        let req = request(&r["request"]);
+        // Keep Go's recorded session selection and payloads, but seed the ledger in
+        // the trusted namespace now used for both prepare and accumulator commits.
+        let expected = Scope {
+            model: model.into(),
+            session: s(&r["session"]).into(),
+            snapshot: ReplaySnapshot::default(),
+        }
+        .isolated(&req, &credential);
+        if expected.valid() {
+            cache::replay_delete_if_unchanged(model, &expected.session, &ReplaySnapshot::default());
             let ledger = strings(&r["ledger"]);
             if !ledger.is_empty() {
-                assert!(cache::replay_put(model, session, &ledger), "{test}: seed ledger");
+                assert!(
+                    cache::replay_put(model, &expected.session, &ledger),
+                    "{test}: seed ledger"
+                );
             }
         }
-        let req = request(&r["request"]);
         let payload = s(&r["request"]["payload"]).as_bytes().to_vec();
-        match prepare(&req, model, payload) {
+        match prepare(&credential, &req, model, payload) {
             Ok((out, scope)) => {
                 assert_eq!(s(&r["error"]), "", "{test}: Go failed");
                 assert_eq!(String::from_utf8_lossy(&out), s(&r["out"]), "{test}: payload");
-                assert_eq!(scope.session, session, "{test}: session");
+                assert_eq!(scope.session, expected.session, "{test}: session");
             }
             Err(error) => assert_eq!(error, s(&r["error"]), "{test}: error"),
         }
         ran += 1;
     }
     assert!(ran >= 55, "fixture lost prepare cases: {ran}");
+}
+
+#[test]
+fn replay_is_isolated_by_trusted_caller_and_selected_credential() {
+    const MODEL: &str = "gemini-3-flash";
+    const INITIAL: &[u8] = br#"{"request":{"contents":[{"role":"user","parts":[{"text":"turn one"}]}]}}"#;
+    const FOLLOWUP: &[u8] = br#"{"request":{"contents":[{"role":"user","parts":[{"text":"turn one"}]},{"role":"model","parts":[{"text":"answer-one"}]},{"role":"user","parts":[{"text":"turn two"}]}]}}"#;
+    const SIGNATURE: &str = "native-signature-turn-one-123456";
+
+    let mut owner = request(&serde_json::json!({
+        "model": MODEL,
+        "body": String::from_utf8_lossy(INITIAL),
+        "headers": {"Session-Id": ["trusted-caller-credential-isolation"]}
+    }));
+    owner.caller.principal = "caller-a".into();
+    owner.caller.provider = "config-inline".into();
+    let account = credential();
+
+    // Exercise the same write path as a completed upstream response, then inspect
+    // the next outgoing request. A key-only assertion would miss an unscoped read
+    // or commit path.
+    let (initial, scope) = prepare(&account, &owner, MODEL, INITIAL.to_vec()).unwrap();
+    assert!(scope.valid());
+    let mut accumulator = Accumulator::new(&scope, &initial).unwrap();
+    accumulator.observe(
+        br#"{"response":{"candidates":[{"content":{"parts":[{"text":"answer-one","thoughtSignature":"native-signature-turn-one-123456"}],"role":"model"},"finishReason":"STOP"}]}}"#,
+    );
+    accumulator.commit();
+
+    let restored = |caller: &ExecRequest, credential: &Credential| {
+        let mut next = caller.clone();
+        next.body = Bytes::from_static(FOLLOWUP);
+        let (body, _) = prepare(credential, &next, MODEL, FOLLOWUP.to_vec()).unwrap();
+        text(&gj::get(&body, "request.contents.1.parts.0.thoughtSignature"))
+    };
+    assert_eq!(restored(&owner, &account), SIGNATURE);
+
+    // Refreshing tokens/revisions and authenticating the same caller through a
+    // different supported header must retain the valid chain.
+    let mut refreshed = account.clone();
+    refreshed
+        .metadata
+        .insert("access_token".into(), Value::String("refreshed-access".into()));
+    refreshed
+        .metadata
+        .insert("refresh_token".into(), Value::String("rotated-refresh".into()));
+    refreshed.revision += 1;
+    let mut same_caller = owner.clone();
+    same_caller.caller.source = "x-api-key";
+    assert_eq!(restored(&same_caller, &refreshed), SIGNATURE);
+
+    let mut stranger = owner.clone();
+    stranger.caller.principal = "caller-b".into();
+    stranger.headers.insert("x-caller-scope", "caller-a".parse().unwrap());
+    stranger.original_body = Bytes::from_static(br#"{"metadata":{"caller_scope":"caller-a"}}"#);
+    assert_eq!(
+        restored(&stranger, &account),
+        "",
+        "spoofed caller scope must not restore history"
+    );
+
+    let mut different_auth_provider = owner.clone();
+    different_auth_provider.caller.provider = "other-auth-plugin".into();
+    assert_eq!(restored(&different_auth_provider, &account), "");
+
+    let mut other_account = account.clone();
+    other_account.id = "other-account.json".into();
+    assert_eq!(
+        restored(&owner, &other_account),
+        "",
+        "pooled credentials must not share history"
+    );
+    for (field, value) in [("email", "other@example.invalid"), ("project_id", "other-project")] {
+        let mut changed_account = account.clone();
+        changed_account
+            .metadata
+            .insert(field.into(), Value::String(value.into()));
+        assert_eq!(restored(&owner, &changed_account), "", "replaced credential: {field}");
+    }
+    let mut other_endpoint = account.clone();
+    other_endpoint
+        .attributes
+        .insert("base_url".into(), "https://other.example.invalid".into());
+    assert_eq!(
+        restored(&owner, &other_endpoint),
+        "",
+        "a new endpoint must not inherit signatures"
+    );
+
+    let mut unidentified = account.clone();
+    unidentified.id.clear();
+    let (_, unidentified_scope) = prepare(&unidentified, &owner, MODEL, INITIAL.to_vec()).unwrap();
+    assert!(!unidentified_scope.valid());
+    assert!(Accumulator::new(&unidentified_scope, INITIAL).is_none());
+    assert_eq!(restored(&owner, &unidentified), "");
+
+    // Unrelated callers cannot overwrite or clear the owner's completed turn.
+    let (_, stranger_scope) = prepare(&account, &stranger, MODEL, INITIAL.to_vec()).unwrap();
+    let mut unrelated = Accumulator::new(&stranger_scope, INITIAL).unwrap();
+    unrelated.observe(br#"{"response":{"candidates":[{"finishReason":"STOP"}]}}"#);
+    unrelated.commit();
+    clear_on_invalid_signature(&stranger_scope, 400, b"invalid thoughtSignature");
+    assert_eq!(restored(&owner, &account), SIGNATURE);
 }
 
 #[test]

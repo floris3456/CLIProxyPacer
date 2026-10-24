@@ -213,7 +213,9 @@ struct TokenWire {
 #[serde(default)]
 struct PollWire {
     error: Option<String>,
-    error_description: Option<String>,
+    // Validate the upstream field's type, but never display a token endpoint's text.
+    #[serde(rename = "error_description")]
+    _error_description: Option<String>,
     #[serde(flatten)]
     token: TokenWire,
 }
@@ -284,10 +286,24 @@ impl DeviceFlow {
         headers.set("X-Msh-Device-Name", hostname().unwrap_or_else(|| "unknown".into()));
         headers.set("X-Msh-Device-Model", device_model());
         headers.set("X-Msh-Device-Id", self.device_id.clone());
-        let upstream = crate::proxy::send(&self.client, url, headers, body, Some(Duration::from_secs(30)))
-            .await
-            .map_err(|_| ExecError::local(502, FailureScope::Transport, "kimi: token request failed"))?;
+        let upstream = crate::proxy::request_once(
+            &self.client,
+            wreq::Method::POST,
+            url,
+            headers,
+            Some(body.into()),
+            Some(Duration::from_secs(30)),
+        )
+        .await
+        .map_err(|_| ExecError::local(502, FailureScope::Transport, "kimi: token request failed"))?;
         let status = upstream.status;
+        if (300..400).contains(&status) {
+            return Err(ExecError::local(
+                502,
+                FailureScope::Transport,
+                "kimi: OAuth endpoint redirects are not allowed",
+            ));
+        }
         let body = crate::proxy::read_all(upstream.body, crate::proxy::MAX_ERROR_BODY, false)
             .await
             .map_err(|_| ExecError::local(502, FailureScope::Transport, "kimi: failed to read token response"))?;
@@ -331,10 +347,7 @@ impl DeviceFlow {
             "authorization_pending" | "slow_down" => return Ok(None),
             "expired_token" => return Err(auth_error(400, "kimi: device code expired")),
             "access_denied" => return Err(auth_error(403, "kimi: access denied by user")),
-            other => {
-                let description = wire.error_description.unwrap_or_default();
-                return Err(auth_error(400, format!("kimi: OAuth error: {other} - {description}")));
-            }
+            _ => return Err(auth_error(400, "kimi: OAuth token exchange failed")),
         }
         tokens(wire.token)
             .map(Some)
@@ -610,7 +623,9 @@ pub(crate) fn open_browser(url: &str) -> bool {
 /// `kimi-auth-url`); returns the path.
 pub fn write_login(auth_dir: &Path, record: &LoginRecord) -> Result<PathBuf, ExecError> {
     let path = auth_dir.join(&record.file_name);
-    write_private(&path, encode_credential(&record.metadata).as_bytes())
+    let file = crate::codex_siwc_bind::CredentialFileLease::acquire_for_write(&path)
+        .map_err(|_| auth_error(500, "kimi: cannot lock credential file"))?;
+    write_private(file.path(), encode_credential(&record.metadata).as_bytes())
         .map_err(|_| auth_error(500, "kimi: cannot write credential file"))?;
     Ok(path)
 }
@@ -625,7 +640,8 @@ pub async fn login(provider: &str, cfg: &cpa_core::config::Config, no_browser: b
         .and_then(|r| r.get("proxy-url"))
         .and_then(|v| v.as_str())
         .unwrap_or_default();
-    let client = crate::proxy::GoClients::new(crate::proxy::Hooks::default()).get(&crate::proxy::Proxy::parse(proxy));
+    let client =
+        crate::proxy::GoClients::new(crate::proxy::Hooks::default()).get_checked(&crate::proxy::Proxy::parse(proxy))?;
     let flow = DeviceFlow::new(client, domain, "");
     login_with(flow, provider, &cfg.auth_dir, no_browser).await
 }
@@ -662,10 +678,14 @@ pub(crate) async fn login_with(
     println!("Saving credentials to {}", path.display());
     let contents = encode_credential(&record.metadata);
     let target = path.clone();
-    tokio::task::spawn_blocking(move || write_private(&target, contents.as_bytes()))
-        .await
-        .map_err(|_| auth_error(500, "kimi: credential publication failed"))?
-        .map_err(|_| auth_error(500, "kimi: cannot write credential file"))?;
+    tokio::task::spawn_blocking(move || {
+        let file =
+            crate::codex_siwc_bind::CredentialFileLease::acquire_for_write(&target).map_err(std::io::Error::other)?;
+        write_private(file.path(), contents.as_bytes())
+    })
+    .await
+    .map_err(|_| auth_error(500, "kimi: credential publication failed"))?
+    .map_err(|_| auth_error(500, "kimi: cannot write credential file"))?;
     println!("Authentication saved to {}", path.display());
     println!("Authenticated as {}", record.label);
     println!("{display} authentication successful!");
@@ -675,6 +695,46 @@ pub(crate) async fn login_with(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn device_poll_errors_hide_endpoint_secrets_and_preserve_control_codes() {
+        use crate::codex_testkit::{Mock, json as reply};
+
+        let mock = Mock::start().await;
+        mock.script(
+            "/api/oauth/token",
+            vec![
+                reply(400, r#"{"error":"authorization_pending"}"#),
+                reply(400, r#"{"error":"slow_down"}"#),
+                reply(400, r#"{"error":"access_denied"}"#),
+                reply(400, r#"{"error":"expired_token"}"#),
+                reply(
+                    400,
+                    r#"{"error":"echoed-device-secret","error_description":"echoed-access-secret"}"#,
+                ),
+            ],
+        );
+        let flow = DeviceFlow::new(
+            wreq::Client::builder().no_proxy().build().unwrap(),
+            DOMAIN_COM,
+            "test-device",
+        )
+        .with_oauth_host(&mock.url);
+        assert!(flow.exchange("test-device-code").await.unwrap().is_none());
+        assert!(flow.exchange("test-device-code").await.unwrap().is_none());
+        assert_eq!(flow.exchange("test-device-code").await.unwrap_err().status, 403);
+        assert_eq!(flow.exchange("test-device-code").await.unwrap_err().status, 400);
+        let error = flow.exchange("test-device-code").await.unwrap_err();
+        assert_eq!(error.status, 400);
+        assert_eq!(&error.body[..], b"kimi: OAuth token exchange failed");
+        let requests = mock.take();
+        assert_eq!(requests.len(), 5);
+        assert!(
+            requests
+                .iter()
+                .all(|r| String::from_utf8_lossy(&r.body).contains("device_code=test-device-code"))
+        );
+    }
 
     fn credential(id: &str, provider: &str, meta: Value) -> Credential {
         let mut c = Credential::from_file(

@@ -25,16 +25,16 @@ pub(crate) const ADVISOR_TOOL: &str = "advisor-tool-2026-03-01";
 const ADVANCED_TOOL_USE: &str = "advanced-tool-use-2025-11-20";
 pub(crate) const EFFORT: &str = "effort-2025-11-24";
 pub(crate) const SERVER_SIDE_FALLBACK: &str = "server-side-fallback-2026-06-01";
-const FALLBACK_CREDIT: &str = "fallback-credit-2026-06-01";
+pub(crate) const FALLBACK_CREDIT: &str = "fallback-credit-2026-06-01";
 const STRUCTURED_OUTPUTS: &str = "structured-outputs-2025-12-15";
 pub(crate) const THINKING_DISPLAY_UPDATES: &str = "thinking-display-updates-2026-08-18";
-const THINKING_BINDING: &str = "thinking-binding-controls-2026-08-01";
+pub(crate) const THINKING_BINDING: &str = "thinking-binding-controls-2026-08-01";
 const THINKING_RESUMPTION: &str = "thinking-resumption-2026-07-17";
 pub(crate) const EXTENDED_CACHE_TTL: &str = "extended-cache-ttl-2025-04-11";
 const PROMPT_CACHING_EVICT: &str = "prompt-caching-evict-2026-05-12";
-const CACHE_DIAGNOSIS: &str = "cache-diagnosis-2026-04-07";
-const REDACT_THINKING: &str = "redact-thinking-2026-02-12";
-const AFK_MODE: &str = "afk-mode-2026-01-31";
+pub(crate) const CACHE_DIAGNOSIS: &str = "cache-diagnosis-2026-04-07";
+pub(crate) const REDACT_THINKING: &str = "redact-thinking-2026-02-12";
+pub(crate) const AFK_MODE: &str = "afk-mode-2026-01-31";
 
 /// Sent on every "cli" entrypoint Messages request, after claude-code-20250219.
 const CONSTANT: [&str; 5] = [

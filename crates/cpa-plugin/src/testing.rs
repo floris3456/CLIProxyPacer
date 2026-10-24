@@ -72,13 +72,36 @@ pub fn goplugins_dir() -> PathBuf {
 
 /// `<tmp>/goplugins/<example>.so` for every example, built once per process. `None`
 /// (after printing a SKIPPED line for `test`) when no suitable Go is installed. `tmp`
-/// is the calling test crate's `CARGO_TARGET_TMPDIR`.
+/// is the calling test crate's `CARGO_TARGET_TMPDIR`. CI may explicitly supply freshly
+/// built fixtures through `CPA_TEST_GOPLUGINS_DIR`; every example must be present and
+/// nonempty, and a suitable Go toolchain is still required.
 pub fn built_plugins(tmp: &Path, test: &str) -> Option<&'static Path> {
     static BUILT: OnceLock<Option<PathBuf>> = OnceLock::new();
     let built = BUILT
         .get_or_init(|| {
-            let go = go_binary()?;
             let src = goplugins_dir();
+            let prebuilt = std::env::var_os("CPA_TEST_GOPLUGINS_DIR").map(|out| {
+                let out = PathBuf::from(out);
+                assert!(
+                    out.is_dir(),
+                    "CPA_TEST_GOPLUGINS_DIR is not a directory: {}",
+                    out.display()
+                );
+                for entry in std::fs::read_dir(src.join("examples")).unwrap() {
+                    let name = entry.unwrap().file_name().to_string_lossy().into_owned();
+                    let artifact = out.join(format!("{name}.so"));
+                    assert!(
+                        artifact.metadata().is_ok_and(|m| m.is_file() && m.len() > 0),
+                        "CPA_TEST_GOPLUGINS_DIR must contain a nonempty plugin fixture: {}",
+                        artifact.display()
+                    );
+                }
+                out
+            });
+            let go = go_binary()?;
+            if let Some(out) = prebuilt {
+                return Some(out);
+            }
             let out = tmp.join("goplugins");
             std::fs::create_dir_all(&out).unwrap();
             for entry in std::fs::read_dir(src.join("examples")).unwrap() {

@@ -304,6 +304,22 @@ pub(crate) fn runtime_version_ok(s: &str) -> bool {
     s.strip_prefix('v').is_some_and(package_version_ok)
 }
 
+pub(crate) fn package_version_at_least(candidate: &str, baseline: &str) -> bool {
+    let parse = |s: &str| {
+        let mut parts = s.trim().split('.');
+        let version = (digits(parts.next()?)?, digits(parts.next()?)?, digits(parts.next()?)?);
+        parts.next().is_none().then_some(version)
+    };
+    matches!((parse(candidate), parse(baseline)), (Some(c), Some(b)) if c >= b)
+}
+
+pub(crate) fn runtime_version_at_least(candidate: &str, baseline: &str) -> bool {
+    match (candidate.trim().strip_prefix('v'), baseline.trim().strip_prefix('v')) {
+        (Some(c), Some(b)) => package_version_at_least(c, b),
+        _ => false,
+    }
+}
+
 /// `extractClaudeDeviceProfile`: a native-looking caller's own software tuple.
 fn candidate(headers: &HeaderMap, settings: &Settings) -> Option<Profile> {
     let user_agent = header(headers, "user-agent").trim().to_owned();

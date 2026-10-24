@@ -467,8 +467,8 @@ impl GeminiExecutor {
         }
     }
 
-    fn client(&self, credential: &Credential, cfg: &Config) -> wreq::Client {
-        self.clients.get(&Proxy::effective(credential, cfg))
+    fn client(&self, credential: &Credential, cfg: &Config) -> Result<wreq::Client, ExecError> {
+        self.clients.get_checked(&Proxy::effective(credential, cfg))
     }
 
     pub async fn execute(
@@ -532,7 +532,7 @@ impl GeminiExecutor {
         .apply(cfg, req, body);
         let headers = request_headers(credential, req);
         let capture = req.capture();
-        let client = self.client(credential, cfg);
+        let client = self.client(credential, cfg)?;
         // One buffer for the send, the request log and the translators below.
         let body = Bytes::from(body);
         let upstream = send_captured(
@@ -620,7 +620,7 @@ impl GeminiExecutor {
             headers.set("Api-Revision", INTERACTIONS_REVISION);
         }
         let capture = req.capture();
-        let client = self.client(credential, cfg);
+        let client = self.client(credential, cfg)?;
         // One buffer for the send, the request log and the translators below.
         let body = Bytes::from(body);
         let upstream = send_captured(
@@ -691,7 +691,7 @@ impl GeminiExecutor {
         let url = format!("{}/{API_VERSION}/models/{base_model}:countTokens", base_url(credential));
         let headers = request_headers(credential, req);
         let capture = req.capture();
-        let client = self.client(credential, cfg);
+        let client = self.client(credential, cfg)?;
         // One buffer for the send, the request log and the translators below.
         let body = Bytes::from(body);
         let upstream = send_captured(

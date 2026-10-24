@@ -276,6 +276,75 @@ fn legacy_matching_follows_go_identity_rules() {
 }
 
 #[tokio::test]
+async fn legacy_cleanup_waits_for_lease_and_rechecks_identity_before_removal() {
+    use crate::codex_siwc_bind::CredentialFileLease;
+
+    for changed_identity in [false, true] {
+        let dir = temp_dir();
+        let canonical = dir.join(credential_file_name("a@example.invalid", "org-1", "acct-1"));
+        let legacy = dir.join("claude-a@example.invalid.json");
+        let canonical_bytes = serde_json::to_vec(&json!({
+            "type":"claude", "email":"a@example.invalid", "organization_uuid":"org-1",
+            "account_uuid":"acct-1", "access_token":"new-login-token"
+        }))
+        .unwrap();
+        std::fs::write(&canonical, &canonical_bytes).unwrap();
+        std::fs::write(
+            &legacy,
+            br#"{"type":"claude","email":"a@example.invalid","organization_uuid":"org-1","access_token":"old-token"}"#,
+        )
+        .unwrap();
+
+        let lease = CredentialFileLease::acquire(&legacy).await.unwrap();
+        let (started, waiting) = tokio::sync::oneshot::channel();
+        let saved = canonical.clone();
+        let old = legacy.clone();
+        let mut cleanup = tokio::task::spawn_blocking(move || {
+            started.send(()).unwrap();
+            remove_legacy_if_matching(&saved, &old, |path| {
+                assert!(
+                    CredentialFileLease::try_acquire(path).unwrap().is_none(),
+                    "the legacy lease remains held through deletion"
+                );
+                std::fs::remove_file(path).map_err(|error| error.to_string())
+            })
+        });
+        waiting.await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut cleanup)
+                .await
+                .is_err(),
+            "cleanup must wait for the legacy writer"
+        );
+        assert!(legacy.exists());
+        assert!(
+            CredentialFileLease::try_acquire(&canonical).unwrap().is_some(),
+            "cleanup must not hold the canonical lease while waiting for the legacy one"
+        );
+        let latest = serde_json::to_vec(&json!({
+            "type":"claude", "email":"a@example.invalid",
+            "organization_uuid": if changed_identity { "org-2" } else { "org-1" },
+            "access_token":"rotated-token"
+        }))
+        .unwrap();
+        std::fs::write(lease.path(), &latest).unwrap();
+        drop(lease);
+        tokio::time::timeout(Duration::from_secs(5), cleanup)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        if changed_identity {
+            assert_eq!(std::fs::read(&legacy).unwrap(), latest);
+        } else {
+            assert!(!legacy.exists());
+        }
+        assert_eq!(std::fs::read(&canonical).unwrap(), canonical_bytes);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[tokio::test]
 async fn a_wrong_state_fails_the_login_without_writing() {
     let dir = temp_dir();
     let mock = oauth_mock().await;

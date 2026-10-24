@@ -2773,20 +2773,41 @@ async fn a_save_whose_parse_saves_the_same_file_completes_after_one_parse() {
     let path = env.dir.join("config.yaml");
     std::fs::write(&path, &env.yaml).unwrap();
     let management = cpa_server::management::Management::new(env.rt.clone(), path);
+    let file = env.rt.config().auth_dir.join("acme.json");
+    let lease = cpa_exec::codex_siwc_bind::CredentialFileLease::acquire(&file)
+        .await
+        .unwrap();
     let body = json!({"calls":[{"method":"host.auth.save","request":{
         "name":"acme.json","json":{"type":"acme","n":1}}}]});
-    let response = tokio::time::timeout(
-        Duration::from_secs(10),
-        env.rt.plugins().serve_management(cpa_plugin::management::Inbound {
-            method: "POST".into(),
-            path: "/v0/management/rec/acme/calls".into(),
-            body: serde_json::to_vec(&body).unwrap().into(),
-            ..Default::default()
-        }),
-    )
-    .await
-    .expect("the save never completed")
-    .unwrap();
+    let mut saving = tokio::spawn({
+        let host = env.rt.plugins().clone();
+        async move {
+            host.serve_management(cpa_plugin::management::Inbound {
+                method: "POST".into(),
+                path: "/v0/management/rec/acme/calls".into(),
+                body: serde_json::to_vec(&body).unwrap().into(),
+                ..Default::default()
+            })
+            .await
+        }
+    });
+    eventually("the save must parse before waiting for its file lease", || {
+        !calls(&env.records, "acme", "auth.parse").is_empty()
+    })
+    .await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut saving)
+            .await
+            .is_err(),
+        "the nested save must wait for the shared credential lease"
+    );
+    assert!(!file.exists());
+    drop(lease);
+    let response = tokio::time::timeout(Duration::from_secs(10), saving)
+        .await
+        .expect("the save never completed")
+        .unwrap()
+        .unwrap();
     let response: Value = serde_json::from_slice(&response.body).unwrap();
     let result = response["results"][0].as_str().unwrap();
     let saved: Value = serde_json::from_str(result.split_once(' ').unwrap().1).unwrap();
@@ -3400,11 +3421,15 @@ async fn a_401_from_a_plugin_executor_refreshes_through_its_auth_provider() {
         "plugin-owned-refresh-401",
         &[("catalog", "model_provider"), ("acme", "auth_provider,executor")],
         "",
-        &[(
-            "acme.json",
-            r#"{"type":"acme","access_token":"old","refresh_token":"r1","keep":"x"}"#,
-        )],
+        &[("acme.json", r#"{"type":"acme","wrapped":"material"}"#)],
         |records| {
+            canned(
+                records,
+                "acme",
+                "auth.parse",
+                json!({"Handled":true,"Auths":[{"Provider":"acme","ID":"acme.json",
+                    "Metadata":{"type":"acme","access_token":"old","refresh_token":"r1","keep":"x"}}]}),
+            );
             canned(
                 records,
                 "catalog",
@@ -3429,6 +3454,15 @@ async fn a_401_from_a_plugin_executor_refreshes_through_its_auth_provider() {
     else {
         return;
     };
+    cpa_server::plugins::reload_plugin_auth_files(&env.rt).await;
+    let parsed = env.rt.store().get("acme.json").unwrap();
+    assert!(parsed.parsed_by_plugin);
+    assert!(!parsed.attributes.contains_key("plugin_virtual"));
+    assert_eq!(parsed.metadata["access_token"], "old");
+    assert_eq!(
+        auth_file(&env, "acme.json"),
+        json!({"type":"acme","wrapped":"material"})
+    );
     let (status, body) = env.chat("acme-1").await;
     assert_eq!(status, 200, "{body}");
     let refreshes = calls(&env.records, "acme", "auth.refresh");
@@ -4405,6 +4439,12 @@ async fn a_plugin_refresh_saves_its_tokens_disabled_state_and_proxy_url() {
     .await;
     let mut edit = cpa_core::credential::MetadataPatch::default();
     edit.set.insert("proxy_url".into(), "socks5://c:3".into());
+    assert!(
+        cpa_exec::codex_siwc_bind::CredentialFileLease::try_acquire(&env.rt.config().auth_dir.join("y.json"))
+            .unwrap()
+            .is_some(),
+        "a plugin awaiting its response must not hold the native refresh lease"
+    );
     store
         .apply_patch("y.json", store.get("y.json").unwrap().revision, &edit)
         .unwrap();

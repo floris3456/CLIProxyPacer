@@ -21,7 +21,7 @@ use sha2::{Digest, Sha256};
 use crate::kimi_auth::{form, open_browser, write_private};
 use crate::kimi_http::rfc3339_utc;
 use crate::meta_wire::{Slot, check_valid, unmarshal};
-use crate::proxy::{GoHeaders, MAX_ERROR_BODY, read_all, send};
+use crate::proxy::{GoHeaders, MAX_ERROR_BODY, read_all, request_once};
 
 pub const DEFAULT_API_BASE_URL: &str = "https://api.meta.ai/v1";
 pub const AUTH_HOST: &str = "https://auth.meta.com";
@@ -260,10 +260,20 @@ impl MetaAuth {
         headers: GoHeaders,
         body: impl Into<bytes::Bytes>,
     ) -> Result<(u16, bytes::Bytes), String> {
-        let upstream = send(&self.client, url, headers, body, Some(HTTP_TIMEOUT))
-            .await
-            .map_err(|e| String::from_utf8_lossy(&e.body).into_owned())?;
+        let upstream = request_once(
+            &self.client,
+            wreq::Method::POST,
+            url,
+            headers,
+            Some(body.into()),
+            Some(HTTP_TIMEOUT),
+        )
+        .await
+        .map_err(|e| String::from_utf8_lossy(&e.body).into_owned())?;
         let status = upstream.status;
+        if (300..400).contains(&status) {
+            return Err("OAuth endpoint redirects are not allowed".into());
+        }
         let body = read_all(upstream.body, MAX_ERROR_BODY, false)
             .await
             .map_err(|e| String::from_utf8_lossy(&e.body).into_owned())?;
@@ -845,9 +855,10 @@ pub fn save_login(auth_dir: &Path, bundle: &Bundle, now: DateTime<Utc>) -> Resul
     };
     let mut metadata = login_metadata(&storage, bundle);
     let path = auth_dir.join(&file_name);
+    let file = crate::codex_siwc_bind::CredentialFileLease::acquire_for_write(&path)?;
     let mut disabled = false;
     // Manager.Login merges only a cleanly decoded, non-empty existing file.
-    if let Ok(raw) = std::fs::read(&path)
+    if let Ok(raw) = std::fs::read(file.path())
         && let Some((existing, true)) = go_map_from_json(&raw)
         && !existing.is_empty()
         && let Some(flag) = merge_existing(&mut metadata, &existing, "meta")
@@ -861,7 +872,7 @@ pub fn save_login(auth_dir: &Path, bundle: &Bundle, now: DateTime<Utc>) -> Resul
             .map_err(|e| format!("auth filestore: invalid metadata weight: {e}"))?;
     }
     metadata.insert("disabled".into(), GoValue::Bool(disabled));
-    save_token_file(&path, &storage, Some(&metadata)).map_err(|e| format!("meta token storage: {e}"))?;
+    save_token_file(file.path(), &storage, Some(&metadata)).map_err(|e| format!("meta token storage: {e}"))?;
     Ok(LoginOutcome { path, label })
 }
 
@@ -874,7 +885,8 @@ pub async fn login(cfg: &cpa_core::config::Config, no_browser: bool) -> Result<P
         .and_then(|r| r.get("proxy-url"))
         .and_then(|v| v.as_str())
         .unwrap_or_default();
-    let client = crate::proxy::GoClients::new(crate::proxy::Hooks::default()).get(&crate::proxy::Proxy::parse(proxy));
+    let client =
+        crate::proxy::GoClients::new(crate::proxy::Hooks::default()).get_checked(&crate::proxy::Proxy::parse(proxy))?;
     let outcome = login_with(MetaAuth::new(client), &cfg.auth_dir, no_browser)
         .await
         .map_err(|e| {

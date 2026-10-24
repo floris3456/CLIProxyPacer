@@ -171,7 +171,7 @@ Only when the user asks for it:
 
 1. Find the Go server's config file (often `config.yaml` next to its binary, or the path in its service definition) and its `auth-dir` (`~/.cli-proxy-api` by default).
 2. Back them up: `cp -a <config.yaml> <config.yaml>.bak` and `cp -a <auth-dir> <auth-dir>.bak`.
-3. Stop the Go server (its service, or the process). Both servers must never run on the same auth folder at the same time, because each refreshes the sign-in tokens and can invalidate the other's.
+3. Stop the Go server (its service, or the process) before switching. Concurrent refreshes are coordinated only when all writers use the same credential file and lock; see [MIGRATING-FROM-GO.md](MIGRATING-FROM-GO.md).
 4. Start cliproxy-rs on the same file: `cliproxy --config <config.yaml>`. It reads the same settings and account files, and the user's existing management key keeps working.
 5. Verify as in step 4 with the port and a client key from that config.
 

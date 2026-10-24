@@ -560,6 +560,7 @@ async fn anthropic_model_list_cloaking_reads_the_shared_setting() {
                 .unwrap()
                 .clone(),
             revision: 0,
+            parsed_by_plugin: false,
             next_refresh_after: None,
         };
         let p = proxy(config, vec![key]).await;
@@ -608,6 +609,7 @@ async fn config_models_alias_and_force_mapping_reach_upstream_and_client() {
             .unwrap()
             .clone(),
         revision: 0,
+        parsed_by_plugin: false,
         next_refresh_after: None,
     };
     key.attributes.insert("prefix".into(), "team".into());
@@ -805,60 +807,107 @@ async fn oauth_upstream(State(mock): State<Arc<OAuthMock>>, req: Request) -> Res
     }
 }
 
-/// Go refreshes OAuth tokens in the background (conductor_refresh.go) and recovers a
-/// rejected token with one refresh-and-retry (tryRefreshAfterUnauthorized): an expired
-/// token is sent first, never awaited.
+/// Expired tokens refresh before inference; unexpected 401s retry once, unless a
+/// configured request-scoped rule owns the error.
 #[tokio::test]
-async fn expired_token_is_used_then_refreshed_once_after_401() {
-    let mock = Arc::new(OAuthMock::default());
-    let upstream_url = serve(axum::Router::new().fallback(oauth_upstream).with_state(mock.clone())).await;
-    let dir = std::env::temp_dir().join(format!("cpa-routes-401-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("claude.json");
-    let metadata = serde_json::json!({"type":"claude","access_token":"sk-ant-oat-old-fake","refresh_token":"fake-refresh",
-        "expired":"2000-01-01T00:00:00Z","account_uuid":"acct-fake","email":"a@example.invalid",
-        "claude_device_ids":["b".repeat(64)]});
-    std::fs::write(&path, metadata.to_string()).unwrap();
-    let mut credential = Credential::from_file(&dir, &path, metadata.as_object().unwrap().clone()).unwrap();
-    credential.attributes.insert("base_url".into(), upstream_url.clone());
-    let oauth = cpa_exec::oauth::OAuth::with_endpoints(
-        wreq::Client::new(),
-        &format!("{upstream_url}/token"),
-        &format!("{upstream_url}/profile"),
-        &format!("{upstream_url}/roles"),
-    );
-    let executors = Executors {
-        claude: ClaudeExecutor::new(&upstream_url).unwrap().with_oauth(oauth),
-        codex: Default::default(),
-        devices: Default::default(),
-        openai: Default::default(),
-        google: Default::default(),
-    };
-    let config = Config::parse("access:\n  api-keys: [client-key]\n").unwrap();
-    let rt = Arc::new(cpa_server::testing::runtime(config, vec![credential], executors));
-    let url = serve(router(rt.clone())).await;
-    let (status, _, text) = post(
-        &url,
-        "/v1/messages",
-        &format!(r#"{{"model":"{MODEL}","max_tokens":5,"messages":[]}}"#),
-    )
-    .await;
-    assert_eq!(status, 200, "{text}");
-    let calls = mock.calls.lock().unwrap().clone();
-    assert_eq!(
-        calls.iter().map(|c| c.split(' ').next().unwrap()).collect::<Vec<_>>(),
-        // Claude's refresh also reads the profile (the Go differential run does too).
-        ["/v1/messages", "/token", "/profile", "/v1/messages"],
-        "{calls:?}"
-    );
-    assert!(calls[0].ends_with("sk-ant-oat-old-fake") && calls[3].ends_with("sk-ant-oat-new-fake"));
-    let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
-    assert_eq!(
-        saved["access_token"], "sk-ant-oat-new-fake",
-        "the rotated token is persisted"
-    );
-    assert_eq!(rt.store().stats().success, 1);
-    std::fs::remove_dir_all(&dir).unwrap();
+async fn token_refresh_respects_expiry_and_request_rules() {
+    for (name, expired, refresh, rule, expected) in [
+        ("expired", true, true, "", &["/token", "/profile", "/v1/messages"][..]),
+        (
+            "expired-missing-identity",
+            true,
+            true,
+            "",
+            &["/token", "/profile", "/v1/messages"][..],
+        ),
+        (
+            "rejected",
+            false,
+            true,
+            "",
+            &["/v1/messages", "/token", "/profile", "/v1/messages"][..],
+        ),
+        ("request-stop", false, true, "stop", &["/v1/messages"][..]),
+        (
+            "request-cooldown",
+            false,
+            true,
+            "stop-and-cooldown",
+            &["/v1/messages"][..],
+        ),
+        ("expired-without-refresh", true, false, "", &[][..]),
+    ] {
+        let mock = Arc::new(OAuthMock::default());
+        let upstream_url = serve(axum::Router::new().fallback(oauth_upstream).with_state(mock.clone())).await;
+        let dir = std::env::temp_dir().join(format!("cpa-routes-refresh-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("claude.json");
+        let mut metadata = serde_json::json!({"type":"claude","access_token":"sk-ant-oat-old-fake",
+            "expired":if expired { "2000-01-01T00:00:00Z" } else { "2099-01-01T00:00:00Z" },
+            "account_uuid":"acct-fake","email":"a@example.invalid","claude_device_ids":["b".repeat(64)]});
+        if refresh {
+            metadata["refresh_token"] = "fake-refresh".into();
+        }
+        if name == "expired-missing-identity" {
+            metadata.as_object_mut().unwrap().remove("claude_device_ids");
+        }
+        if !rule.is_empty() {
+            metadata["request_scoped_errors"] = serde_json::json!([
+                {"status":401,"match":["token expired"],"action":rule}
+            ]);
+        }
+        std::fs::write(&path, metadata.to_string()).unwrap();
+        let mut credential = Credential::from_file(&dir, &path, metadata.as_object().unwrap().clone()).unwrap();
+        credential.attributes.insert("base_url".into(), upstream_url.clone());
+        let oauth = cpa_exec::oauth::OAuth::with_endpoints(
+            wreq::Client::new(),
+            &format!("{upstream_url}/token"),
+            &format!("{upstream_url}/profile"),
+            &format!("{upstream_url}/roles"),
+        );
+        let executors = Executors {
+            claude: ClaudeExecutor::new(&upstream_url).unwrap().with_oauth(oauth),
+            codex: Default::default(),
+            devices: Default::default(),
+            openai: Default::default(),
+            google: Default::default(),
+        };
+        let mut config = Config::parse("access:\n  api-keys: [client-key]\n").unwrap();
+        config.auth_dir = dir.clone();
+        let rt = Arc::new(cpa_server::testing::runtime(config, vec![credential], executors));
+        let url = serve(router(rt.clone())).await;
+        let (status, _, text) = post(
+            &url,
+            "/v1/messages",
+            &format!(r#"{{"model":"{MODEL}","max_tokens":5,"messages":[]}}"#),
+        )
+        .await;
+        let succeeds = refresh && rule.is_empty();
+        assert_eq!(status, if succeeds { 200 } else { 401 }, "{name}: {text}");
+        let calls = mock.calls.lock().unwrap().clone();
+        assert_eq!(
+            calls.iter().map(|c| c.split(' ').next().unwrap()).collect::<Vec<_>>(),
+            expected,
+            "{name}: {calls:?}"
+        );
+        if expired {
+            assert!(
+                !calls.iter().any(|call| call.ends_with("sk-ant-oat-old-fake")),
+                "{name}: expired token sent"
+            );
+        }
+        let saved: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            saved["access_token"],
+            if succeeds {
+                "sk-ant-oat-new-fake"
+            } else {
+                "sk-ant-oat-old-fake"
+            },
+            "{name}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
 
 /// A `siwc` map does not give a Claude credential a refresh path: a 401 on a Claude token

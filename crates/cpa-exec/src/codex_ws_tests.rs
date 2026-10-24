@@ -479,9 +479,9 @@ async fn a_global_proxy_reload_keeps_the_open_socket() {
 }
 
 /// Go `websocketSessionTargetMatches` compares the trimmed proxy settings, not parsed
-/// proxies: `direct` and `none`, or two unparseable settings, are different targets. A
+/// proxies: `direct` and `none` are different targets. A
 /// continuation that changes `(global, own)` after the first turn keeps the socket or
-/// needs a replay as Go decides.
+/// needs a replay as Go decides. Invalid routes fail closed in the separate test below.
 #[tokio::test]
 async fn proxy_settings_match_as_go_compares_them() {
     type Row = (
@@ -491,11 +491,10 @@ async fn proxy_settings_match_as_go_compares_them() {
         Option<&'static str>,
         bool,
     );
-    let rows: [Row; 6] = [
+    let rows: [Row; 5] = [
         ("", None, "http://127.0.0.1:1", None, true),
         ("direct", Some("none"), "http://127.0.0.1:1", None, false),
         ("", Some("direct"), "", Some("none"), false),
-        ("", Some("bogus://a"), "", Some("bogus://b"), false),
         ("", Some("direct"), "", Some(" direct "), true),
         ("none", None, "NONE", None, true),
     ];
@@ -527,6 +526,54 @@ async fn proxy_settings_match_as_go_compares_them() {
             Err(e) => assert!(!reuse && e.is_replay_required(), "{row}: {e:?}"),
         }
         assert_eq!(up.dials.lock().unwrap().len(), 1, "{row}");
+    }
+}
+
+/// An explicit bad proxy cannot open a direct socket or send another frame on the
+/// previous credential route when a live session's own proxy setting changes.
+#[tokio::test]
+async fn invalid_proxy_settings_cannot_open_or_replace_a_websocket() {
+    for invalid in ["bogus://a", "http://proxy-user:proxy-secret@127.0.0.1:0"] {
+        let (up, url) = upstream(vec![Act::Send(vec![CREATED, COMPLETED]); 2]).await;
+        let executor = CodexExecutor::new().unwrap();
+        let cfg = Config::default();
+        let mut cred = credential(&url);
+        cred.attributes.insert("proxy_url".into(), invalid.into());
+        let first = executor
+            .execute_in_session(&cred, request(BODY), &cfg, &session(false))
+            .await
+            .err()
+            .expect("an invalid route cannot open a direct socket");
+        assert_eq!(first.status, 502);
+        assert_eq!(first.scope, FailureScope::Transport);
+        assert_eq!(&first.body[..], b"invalid upstream proxy configuration");
+        assert!(up.dials.lock().unwrap().is_empty());
+        assert!(up.frames.lock().unwrap().is_empty());
+
+        cred.attributes.insert("proxy_url".into(), "direct".into());
+        let response = executor
+            .execute_in_session(&cred, request(BODY), &cfg, &session(false))
+            .await
+            .unwrap();
+        let events = collect(response).await;
+        assert!(events.len() == 2 && events.iter().all(Result::is_ok), "{events:?}");
+        cred.attributes.insert("proxy_url".into(), invalid.into());
+        let continuation = executor
+            .execute_in_session(&cred, request(BODY), &cfg, &session(true))
+            .await
+            .err()
+            .expect("the old socket cannot serve the changed route");
+        assert!(continuation.is_replay_required(), "{continuation}");
+        let replacement = executor
+            .execute_in_session(&cred, request(BODY), &cfg, &session(false))
+            .await
+            .err()
+            .expect("a replay cannot fall back to direct either");
+        assert_eq!(replacement.status, 502);
+        assert_eq!(replacement.scope, FailureScope::Transport);
+        assert_eq!(&replacement.body[..], b"invalid upstream proxy configuration");
+        assert_eq!(up.dials.lock().unwrap().len(), 1);
+        assert_eq!(up.frames.lock().unwrap().len(), 1);
     }
 }
 

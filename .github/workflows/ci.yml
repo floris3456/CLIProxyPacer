@@ -1,7 +1,7 @@
-# Formatting, lints, the full test suite and the harness build on every pull request and
-# push to master, plus clippy and the file writer tests on Windows and the Linux size and
-# idle gates. release.yml calls this workflow too, so a tagged release runs the same checks
-# before it builds anything.
+# Formatting, Linux lints, the full offline test suite and the harness build on every
+# pull request. Platform, optional-feature and release-size checks are selected below;
+# master pushes, manual runs and releases run all of them. Unknown paths or an unavailable
+# PR base also run all checks. Changes to this workflow validate the complete workflow.
 # One run per change: pushes to master, and pull requests through `pull_request` only. A
 # branch push used to start a second run of every job for the same commit. Runs are
 # grouped per pull request (or per ref outside one), and a newer push cancels the older
@@ -30,26 +30,97 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
+  prepare:
+    name: format and select checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      perf: ${{ steps.checks.outputs.perf }}
+      windows: ${{ steps.checks.outputs.windows }}
+      features: ${{ steps.checks.outputs.features }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # The PR merge commit's base parent is enough; if it is absent, run all checks.
+          fetch-depth: 2
+          persist-credentials: false
+      - name: Rustfmt
+        run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component rustfmt && rustup default "$RUST_TOOLCHAIN"
+      - name: Format
+        run: cargo fmt --all --check
+      - name: Select additional checks
+        id: checks
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          full=true
+          perf=false windows=false features=false
+          # Only a small, known set of provider/documentation paths can omit the extra
+          # builds. All other paths (including manifests, native code and CI) fail closed.
+          if [ "$EVENT_NAME" = pull_request ] && [ -n "$BASE_SHA" ] &&
+             git diff --name-only -z "$BASE_SHA"...HEAD > "$RUNNER_TEMP/ci-changes"; then
+            full=false
+            while IFS= read -r -d '' path; do
+              case "$path" in
+                Cargo.toml|Cargo.lock|*/Cargo.toml|*/Cargo.lock|*/build.rs) full=true ;;
+                *.md|docs/*|harness/*) ;;
+                bench/*) perf=true ;;
+                crates/cpa-exec/src/*.rs|crates/cpa-translate/src/*.rs|crates/cpa-common/src/*.rs)
+                  case "$path" in
+                    *_auth*|*_oauth*|*/oauth*|*_login*|*siwc*|*/kimi_http.rs|*/codex_tls*|*/tls.rs|*/proxy.rs|*/lib.rs) windows=true ;;
+                  esac
+                  case "$path" in
+                    crates/cpa-common/*|crates/cpa-translate/*|crates/cpa-exec/src/codex*|*/wsrelay*|*/upstream.rs|*/wire.rs|*/proxy.rs|*/tls.rs|*/replay.rs|*/lib.rs)
+                      features=true ;;
+                  esac
+                  ;;
+                *) full=true ;;
+              esac
+            done < "$RUNNER_TEMP/ci-changes"
+          fi
+          if [ "$full" = true ]; then
+            perf=true windows=true features=true
+          fi
+          printf 'perf=%s\nwindows=%s\nfeatures=%s\n' "$perf" "$windows" "$features" >> "$GITHUB_OUTPUT"
+          {
+            echo 'Linux Clippy, the full offline workspace suite, doctests, vendored gjson tests, cache-replay tests and the harness build always run.'
+            printf '\nAdditional checks: Windows=%s, size/idle=%s, media-relay/pprof=%s.\n' "$windows" "$perf" "$features"
+            echo 'Manual runs, master pushes and releases run every check.'
+          } >> "$GITHUB_STEP_SUMMARY"
+
   linux:
     name: tests (Linux)
+    needs: prepare
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     env:
       # No debug info in test builds: linking about 55 test binaries with full debug info
       # was most of a warm build (18 GB in target/debug/deps). Panic messages keep their
-      # file and line. Only for this job and the next: rust-cache keys its caches on
-      # CARGO_* variables, and the perf and Windows jobs keep theirs.
+      # file and line. Use matching dev/test settings so Clippy and tests can reuse
+      # dependency and native-build artifacts on this runner.
+      CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - name: Build tools
         # BoringSSL (through btls-sys) needs cmake, clang and perl; bindgen needs libclang.
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake clang libclang-dev perl
+        # Try the runner's package index first; unrelated apt mirrors can stall update.
+        timeout-minutes: 5
+        run: |
+          build_apt=(sudo apt-get -o Acquire::Retries=1 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20)
+          build_packages=(cmake clang libclang-dev perl)
+          if ! "${build_apt[@]}" install -y --no-upgrade --no-install-recommends "${build_packages[@]}"; then
+            "${build_apt[@]}" update
+            "${build_apt[@]}" install -y --no-upgrade --no-install-recommends "${build_packages[@]}"
+          fi
       - name: Rust
-        run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal && rustup default "$RUST_TOOLCHAIN"
+        run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy && rustup default "$RUST_TOOLCHAIN"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
       - uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
         with:
           tool: cargo-nextest@0.9.148
@@ -65,7 +136,7 @@ jobs:
       - name: PostgreSQL server binaries
         run: |
           newest() { find /usr/lib/postgresql -mindepth 2 -maxdepth 2 -name bin -type d 2>/dev/null | sort -V | tail -n 1; }
-          bin=$(newest)
+          bin=$(newest) || bin=
           if [ -z "$bin" ] || [ ! -x "$bin/initdb" ]; then
             sudo apt-get install -y --no-install-recommends postgresql
             bin=$(newest)
@@ -76,7 +147,25 @@ jobs:
         run: |
           cargo fetch --locked
           cargo fetch --locked --manifest-path vendor/gjson/Cargo.toml
+          cargo fetch --locked --manifest-path harness/rust/Cargo.toml
           cd crates/cpa-plugin/tests/goplugins && go mod download
+      - name: Clippy
+        env:
+          CARGO_NET_OFFLINE: "true"
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Profiler excluded from default normal dependencies
+        env:
+          CARGO_NET_OFFLINE: "true"
+        run: |
+          cargo tree --locked -p cliproxy --edges normal --prefix none > default-dependencies.txt
+          if grep -qE '^(pprof|backtrace) v' default-dependencies.txt; then
+            echo '::error::CPU profiler and symbol resolver must remain opt-in'
+            exit 1
+          fi
+      - name: Harness
+        env:
+          CARGO_NET_OFFLINE: "true"
+        run: cargo check --locked --manifest-path harness/rust/Cargo.toml --target-dir target
       - name: Test, with external network denied
         # A loopback-only network namespace, as the project's merge gates use, so a test
         # that tries to reach a real provider fails instead of sending anything. The tests
@@ -85,12 +174,26 @@ jobs:
         # gate (crates/cpa-server/tests/alloc_budget.rs) and the tests with wall-clock
         # bounds alone. Nextest skips doc tests, so cargo test runs those, then the tests
         # of the patched gjson in vendor/, which is outside the workspace.
+        # Prebuild Go fixtures once; each Nextest test still runs in its own process.
         # CPA_TEST_NO_SKIP makes a test that would skip for a missing Go toolchain or
         # PostgreSQL fail instead: a passing test's output is captured, so a printed skip
         # line never reaches the log.
         run: |
           tests='
-            cargo nextest run --workspace --locked --profile ci 2>&1 | tee test.log
+            plugin_build=$(mktemp -d "$PWD/target/go-plugin-fixtures.XXXXXX")
+            (
+              cd crates/cpa-plugin/tests/goplugins
+              mkdir "$plugin_build/telemetry"
+              printf off > "$plugin_build/telemetry/mode"
+              export CGO_ENABLED=1 GONOPROXY=none GOPRIVATE= GOSUMDB=off GOFLAGS=-mod=readonly
+              export TEST_TELEMETRY_DIR="$plugin_build/telemetry"
+              for example in examples/*; do
+                go build -mod=readonly -buildmode=c-shared \
+                  -o "$plugin_build/${example##*/}.so" "./$example"
+              done
+            )
+            CPA_TEST_GOPLUGINS_DIR="$plugin_build" cargo nextest run --workspace --locked --profile ci 2>&1 | tee test.log
+            rm -rf -- "$plugin_build"
             cargo test --workspace --doc --locked 2>&1 | tee -a test.log
             cargo test --locked --manifest-path vendor/gjson/Cargo.toml --target-dir target 2>&1 | tee -a test.log
             python3 bench/test-claude-cache-replay.py 2>&1 | tee -a test.log
@@ -101,6 +204,7 @@ jobs:
             "GOMODCACHE=$(go env GOMODCACHE)" "GOCACHE=$(go env GOCACHE)" \
             "CPA_TEST_PG_BIN=$CPA_TEST_PG_BIN" CPA_TEST_NO_SKIP=1 \
             CARGO_NET_OFFLINE=true CARGO_TERM_COLOR=always CARGO_INCREMENTAL=0 \
+            "CARGO_PROFILE_DEV_DEBUG=$CARGO_PROFILE_DEV_DEBUG" \
             "CARGO_PROFILE_TEST_DEBUG=$CARGO_PROFILE_TEST_DEBUG" \
             GOTOOLCHAIN=local GOPROXY=off \
             unshare --net -- sh -c 'ip link set lo up && exec setpriv --reuid="$1" --regid="$2" --init-groups -- bash -eo pipefail -c "$3"' \
@@ -121,49 +225,8 @@ jobs:
             }
             END { printf "%d passed, %d failed, %d ignored\n", passed, failed, ignored }'
 
-  # Everything that does not need the test build: formatting, clippy over every target,
-  # the harness, and the Codex Live media relay tests, which build cpa-server with its
-  # optional media-relay feature. In parallel with the tests above.
-  lint:
-    name: fmt, clippy, harness and media relay tests (Linux)
-    runs-on: ubuntu-24.04
-    timeout-minutes: 120
-    env:
-      CARGO_PROFILE_TEST_DEBUG: "0"
-    steps:
-      - uses: actions/checkout@v7
-      - name: Build tools
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake clang libclang-dev perl
-      - name: Rust
-        run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component rustfmt,clippy && rustup default "$RUST_TOOLCHAIN"
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          save-if: ${{ github.ref == 'refs/heads/master' }}
-      - uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
-        with:
-          tool: cargo-nextest@0.9.148
-      - name: Format
-        run: cargo fmt --all --check
-      - name: Fetch dependencies
-        run: |
-          cargo fetch --locked
-          cargo fetch --locked --manifest-path harness/rust/Cargo.toml
-      - name: Clippy
-        env:
-          CARGO_NET_OFFLINE: "true"
-        run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - name: Profiler excluded from default normal dependencies
-        run: |
-          cargo tree --locked -p cliproxy --edges normal --prefix none > default-dependencies.txt
-          if grep -qE '^(pprof|backtrace) v' default-dependencies.txt; then
-            echo '::error::CPU profiler and symbol resolver must remain opt-in'
-            exit 1
-          fi
-      - name: Harness
-        env:
-          CARGO_NET_OFFLINE: "true"
-        run: cargo check --locked --manifest-path harness/rust/Cargo.toml --target-dir target
       - name: Media relay and CPU profiler tests, with external network denied
+        if: needs.prepare.outputs.features == 'true'
         # The same loopback-only namespace as the tests above. All of cpa-server's unit
         # tests run with the feature on, the 25 behind it included.
         run: |
@@ -171,34 +234,38 @@ jobs:
           sudo env "PATH=$PATH" "HOME=$HOME" \
             "CARGO_HOME=${CARGO_HOME:-$HOME/.cargo}" "RUSTUP_HOME=${RUSTUP_HOME:-$HOME/.rustup}" \
             CPA_TEST_NO_SKIP=1 CARGO_NET_OFFLINE=true CARGO_TERM_COLOR=always CARGO_INCREMENTAL=0 \
+            "CARGO_PROFILE_DEV_DEBUG=$CARGO_PROFILE_DEV_DEBUG" \
             "CARGO_PROFILE_TEST_DEBUG=$CARGO_PROFILE_TEST_DEBUG" \
             unshare --net -- sh -c 'ip link set lo up && exec setpriv --reuid="$1" --regid="$2" --init-groups -- cargo nextest run -p cpa-server --features media-relay,pprof --lib --locked --profile ci' \
             sh "$(id -u)" "$(id -g)"
 
   perf:
-    name: ${{ matrix.gates }} (Linux)
+    name: size and idle gates (Linux)
+    needs: prepare
+    if: needs.prepare.outputs.perf == 'true'
     # The release builds use Ubuntu 22.04 too, so the sizes compare with theirs, and its
-    # unprivileged user namespaces give bench/idle.sh a loopback-only network. The two
-    # idle gates run on separate runners, so neither waits out the other's 60 s window;
-    # each still has its machine to itself. Both build the same release binary.
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - { gates: "size and idle gates, 1 auth file", auth-files: 1 }
-          - { gates: "idle gate, 2,000 auth files", auth-files: 2000 }
+    # unprivileged user namespaces give bench/idle.sh a loopback-only network. Build
+    # once, then measure both auth counts sequentially without competing processes.
     runs-on: ubuntu-22.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - name: Build tools
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends cmake clang libclang-dev perl
+        timeout-minutes: 5
+        run: |
+          build_apt=(sudo apt-get -o Acquire::Retries=1 -o Acquire::http::Timeout=20 -o Acquire::https::Timeout=20)
+          build_packages=(cmake clang libclang-dev perl)
+          if ! "${build_apt[@]}" install -y --no-upgrade --no-install-recommends "${build_packages[@]}"; then
+            "${build_apt[@]}" update
+            "${build_apt[@]}" install -y --no-upgrade --no-install-recommends "${build_packages[@]}"
+          fi
       - name: Rust
         run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal && rustup default "$RUST_TOOLCHAIN"
-      # Both entries share one cache; one of them saves it.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          save-if: ${{ github.ref == 'refs/heads/master' && matrix.auth-files == 1 }}
+          save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
       - name: Build
         run: |
           cargo tree --locked -p cliproxy --edges normal --prefix none > size-dependencies.txt
@@ -209,22 +276,23 @@ jobs:
           cargo build --release --locked -p cliproxy
       # Bytes and counts against bench/budgets.txt, never elapsed time.
       - name: Size
-        if: matrix.auth-files == 1
         run: |
           name=cliproxy-ci-x86_64-unknown-linux-gnu
           mkdir -p "$name" && cp target/release/cliproxy README.md LICENSE "$name/"
           tar -czf "$name.tar.gz" "$name"
           bench/gate.sh size x86_64-unknown-linux-gnu target/release/cliproxy "$name.tar.gz"
-      - name: Idle
-        env:
-          AUTH_FILES: ${{ matrix.auth-files }}
-        run: bench/gate.sh idle linux target/release/cliproxy "$AUTH_FILES"
+      - name: Idle, 1 auth file
+        run: bench/gate.sh idle linux target/release/cliproxy 1
+      - name: Idle, 2,000 auth files
+        run: bench/gate.sh idle linux target/release/cliproxy 2000
 
   # Clippy over every target (tests, examples, benches) with warnings as errors, so code
   # that only builds on Windows, test-only code included, is held to the Linux rules.
   # Checking only, no codegen or link, so it stays a few minutes on a warm cache.
   windows:
     name: clippy (Windows)
+    needs: prepare
+    if: needs.prepare.outputs.windows == 'true'
     runs-on: windows-2025
     timeout-minutes: 60
     defaults:
@@ -232,6 +300,8 @@ jobs:
         shell: bash
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       # btls-sys keeps BoringSSL's assembly on a native MSVC build, and BoringSSL assembles
       # x86_64 Windows code with NASM, which the image lacks. bindgen needs libclang.
       - name: NASM and libclang
@@ -243,7 +313,7 @@ jobs:
         run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component clippy --target x86_64-pc-windows-msvc && rustup default "$RUST_TOOLCHAIN"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          save-if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked --target x86_64-pc-windows-msvc -- -D warnings
       # The credential and config file writers on Windows, against loopback mocks only.

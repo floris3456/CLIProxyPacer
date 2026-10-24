@@ -142,7 +142,13 @@ fn check_request(name: &str, wire: &str, go: &Value) {
         (go["method"].as_str().unwrap(), want_target.as_str()),
         "{name}"
     );
-    assert_eq!(body, go["body"].as_str().unwrap(), "{name}: body");
+    // These immutable captures predate the Hub identity update. Onboarding must
+    // advertise the same current version in its metadata and User-Agent.
+    let expected_body = go["body"].as_str().unwrap().replace(
+        "\"ide_version\":\"2.9.1\"",
+        &format!("\"ide_version\":\"{}\"", crate::antigravity_version::latest_version()),
+    );
+    assert_eq!(body, expected_body, "{name}: body");
     let wire_headers: Vec<(String, String)> = lines
         .filter_map(|l| l.split_once(": "))
         .map(|(n, v)| (n.to_ascii_lowercase(), v.to_owned()))
@@ -156,7 +162,10 @@ fn check_request(name: &str, wire: &str, go: &Value) {
         .map(|h| {
             (
                 h[0].as_str().unwrap().to_ascii_lowercase(),
-                h[1].as_str().unwrap().to_owned(),
+                h[1].as_str().unwrap().replace(
+                    "antigravity/hub/2.9.1 darwin/arm64",
+                    &crate::antigravity_version::user_agent(),
+                ),
             )
         })
         .collect();
@@ -303,6 +312,17 @@ async fn auth_matches_go() {
                     assert!(op == "refresh" || must_prepare(&credential), "{name}");
                     let got = prepare(&clients, &credential, &cfg).await;
                     match go_error(case) {
+                        Some(_) if name == "prepare_expired_token_project_denied" => {
+                            // Deliberate safeguard: preserve the token response for
+                            // persistence even when both project lookups failed. The
+                            // unchanged Go fixture still checks every wire request.
+                            let patch = got.expect("successful rotation must survive project failure");
+                            let tokens: Value =
+                                serde_json::from_str(case["replies"][0]["body"].as_str().unwrap()).unwrap();
+                            assert_eq!(patch.set.get("access_token"), tokens.get("access_token"));
+                            assert_eq!(patch.set.get("refresh_token"), tokens.get("refresh_token"));
+                            assert!(!patch.set.contains_key("project_id"));
+                        }
                         Some(error) => {
                             let e = got.err().unwrap_or_else(|| panic!("{name}: no error"));
                             assert_eq!(String::from_utf8_lossy(&e.body), error, "{name}: error");
@@ -332,6 +352,73 @@ async fn auth_matches_go() {
         for (wire, go) in wire.iter().zip(&go) {
             check_request(name, wire, go);
         }
+    }
+}
+
+#[tokio::test]
+async fn forced_refresh_uses_replacement_token_for_missing_project() {
+    let mock = Mock::start(vec![
+        (
+            200,
+            json!({"access_token":"new-access", "refresh_token":"new-grant", "expires_in":3600}).to_string(),
+        ),
+        (200, json!({"cloudaicompanionProject":"new-project"}).to_string()),
+    ])
+    .await;
+    let c = credential(&json!({"metadata":{
+        "type":"antigravity", "access_token":"rejected-but-fresh", "refresh_token":"old-grant", "expired":"FAR"
+    }}));
+    let patch = prepare_forced(&mock.clients(), &c, &Config::default()).await.unwrap();
+    assert_eq!(patch.set["access_token"], "new-access");
+    assert_eq!(patch.set["refresh_token"], "new-grant");
+    assert_eq!(patch.set["project_id"], "new-project");
+    let requests = mock.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    assert!(requests[0].starts_with("POST /token "));
+    assert!(requests[0].contains("refresh_token=old-grant"));
+    assert!(requests[1].starts_with("POST /v1internal:loadCodeAssist "));
+    assert!(requests[1].contains("Bearer new-access"));
+    assert!(requests.iter().all(|request| !request.contains("rejected-but-fresh")));
+}
+
+#[tokio::test]
+async fn project_failure_keeps_rotated_tokens_for_the_next_preparation() {
+    for forced in [false, true] {
+        let mut replies = vec![
+            (
+                200,
+                json!({"access_token":"new-access", "refresh_token":"new-grant", "expires_in":3600}).to_string(),
+            ),
+            (403, "project discovery unavailable".into()),
+        ];
+        if !forced {
+            replies.push((404, "second discovery unavailable".into()));
+        }
+        replies.push((200, json!({"cloudaicompanionProject":"recovered-project"}).to_string()));
+        let mock = Mock::start(replies).await;
+        let clients = mock.clients();
+        let cfg = Config::default();
+        let mut c = credential(&json!({"metadata":{
+            "type":"antigravity", "access_token":"old-access", "refresh_token":"old-grant",
+            "expired":if forced { "FAR" } else { "PAST" }
+        }}));
+        let patch = if forced {
+            prepare_forced(&clients, &c, &cfg).await
+        } else {
+            prepare(&clients, &c, &cfg).await
+        }
+        .expect("successful rotation must survive project discovery failure");
+        assert_eq!(patch.set["access_token"], "new-access");
+        assert_eq!(patch.set["refresh_token"], "new-grant");
+        assert!(!patch.set.contains_key("project_id"));
+        patch.apply(&mut c.metadata);
+        assert!(must_prepare(&c), "project discovery still blocks inference");
+        let project = prepare(&clients, &c, &cfg).await.unwrap();
+        assert_eq!(project.set["project_id"], "recovered-project");
+        assert!(!project.set.contains_key("access_token"));
+        let requests = mock.requests.lock().unwrap();
+        assert_eq!(requests.iter().filter(|r| r.starts_with("POST /token ")).count(), 1);
+        assert!(requests.iter().skip(1).all(|r| r.contains("Bearer new-access")));
     }
 }
 

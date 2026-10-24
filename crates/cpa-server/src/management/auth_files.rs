@@ -959,10 +959,13 @@ fn store_file(state: &Management, name: &str, data: &[u8], v8: bool) -> Result<(
         serde_json::to_vec(&persisted).map_err(|e| (false, e.to_string()))?
     };
     let _guard = state.disk.lock().unwrap_or_else(PoisonError::into_inner);
+    // Upload is an explicit replacement, serialized with refresh through publication.
+    let file = cpa_exec::codex_siwc_bind::CredentialFileLease::acquire_blocking(&dst)
+        .map_err(|e| (false, format!("failed to lock credential file: {e}")))?;
     if v8 {
         state.oauth.invalidate_siwc(&dst);
     }
-    write_file(&dst, &bytes).map_err(|e| (false, format!("failed to write file: {e}")))?;
+    write_file(file.path(), &bytes).map_err(|e| (false, format!("failed to write file: {e}")))?;
     {
         let mut fallbacks = state.fallbacks.lock().unwrap_or_else(PoisonError::into_inner);
         if synthesized.is_none() {
@@ -1013,55 +1016,59 @@ pub(crate) async fn upload(
             Ok(files) => files,
             Err(e) => return fail(StatusCode::BAD_REQUEST, format!("invalid multipart form: {e}")),
         };
-        let store_part = |part: &multipart::FilePart| -> Result<String, (bool, String)> {
-            let name = multipart::go_base(part.filename.trim()).to_owned();
-            if !ends_json(&name) {
-                return Err((true, "file must be .json".into()));
-            }
-            store_file(&state, &name, &part.data, v8).map(|()| name)
-        };
-        return match files.len() {
-            0 => fail(StatusCode::BAD_REQUEST, "no files uploaded"),
-            1 => match store_part(&files[0]) {
-                Ok(_) => reply(StatusCode::OK, [("status", "ok".into())]),
-                Err((true, msg)) => fail(StatusCode::BAD_REQUEST, msg),
-                Err((false, msg)) => fail(StatusCode::INTERNAL_SERVER_ERROR, msg),
-            },
-            _ => {
-                let mut uploaded = Vec::new();
-                let mut failed = Vec::new();
-                for part in &files {
-                    match store_part(part) {
-                        Ok(name) => uploaded.push(Value::from(name)),
-                        Err((_, msg)) => {
-                            let name = multipart::go_base(&part.filename);
-                            failed.push(h([("name", name.into()), ("error", msg.into())]));
+        return tokio::task::spawn_blocking(move || {
+            let store_part = |part: &multipart::FilePart| -> Result<String, (bool, String)> {
+                let name = multipart::go_base(part.filename.trim()).to_owned();
+                if !ends_json(&name) {
+                    return Err((true, "file must be .json".into()));
+                }
+                store_file(&state, &name, &part.data, v8).map(|()| name)
+            };
+            match files.len() {
+                0 => fail(StatusCode::BAD_REQUEST, "no files uploaded"),
+                1 => match store_part(&files[0]) {
+                    Ok(_) => reply(StatusCode::OK, [("status", "ok".into())]),
+                    Err((true, msg)) => fail(StatusCode::BAD_REQUEST, msg),
+                    Err((false, msg)) => fail(StatusCode::INTERNAL_SERVER_ERROR, msg),
+                },
+                _ => {
+                    let mut uploaded = Vec::new();
+                    let mut failed = Vec::new();
+                    for part in &files {
+                        match store_part(part) {
+                            Ok(name) => uploaded.push(Value::from(name)),
+                            Err((_, msg)) => {
+                                let name = multipart::go_base(&part.filename);
+                                failed.push(h([("name", name.into()), ("error", msg.into())]));
+                            }
                         }
                     }
-                }
-                let count = uploaded.len();
-                if failed.is_empty() {
-                    reply(
-                        StatusCode::OK,
-                        [
-                            ("status", "ok".into()),
-                            ("uploaded", count.into()),
-                            ("files", uploaded.into()),
-                        ],
-                    )
-                } else {
-                    reply(
-                        StatusCode::MULTI_STATUS,
-                        [
-                            ("status", "partial".into()),
-                            ("uploaded", count.into()),
-                            ("files", uploaded.into()),
-                            ("failed", failed.into()),
-                        ],
-                    )
+                    let count = uploaded.len();
+                    if failed.is_empty() {
+                        reply(
+                            StatusCode::OK,
+                            [
+                                ("status", "ok".into()),
+                                ("uploaded", count.into()),
+                                ("files", uploaded.into()),
+                            ],
+                        )
+                    } else {
+                        reply(
+                            StatusCode::MULTI_STATUS,
+                            [
+                                ("status", "partial".into()),
+                                ("uploaded", count.into()),
+                                ("files", uploaded.into()),
+                                ("failed", failed.into()),
+                            ],
+                        )
+                    }
                 }
             }
-        };
+        })
+        .await
+        .unwrap_or_else(|_| fail(StatusCode::INTERNAL_SERVER_ERROR, "internal error"));
     }
     let q = Query::parse(raw);
     let name = q.first("name").trim().to_owned();
@@ -1546,7 +1553,17 @@ fn virtual_source_status(state: &Management, target: &Credential, disabled: bool
     if source.is_empty() {
         return fail(StatusCode::INTERNAL_SERVER_ERROR, PLUGIN_VIRTUAL);
     }
-    let data = match std::fs::read(&source) {
+    // The read and status-only write must see the same refreshed token document.
+    let file = match cpa_exec::codex_siwc_bind::CredentialFileLease::acquire_blocking(Path::new(&source)) {
+        Ok(file) => file,
+        Err(e) => {
+            return fail(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to lock source auth file: {e}"),
+            );
+        }
+    };
+    let data = match std::fs::read(file.path()) {
         Ok(data) => data,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             return fail(StatusCode::NOT_FOUND, "auth file not found");
@@ -1593,12 +1610,14 @@ fn virtual_source_status(state: &Management, target: &Credential, disabled: bool
             "failed to update source auth file: marshal auth file",
         );
     };
-    if let Err(e) = write_file(Path::new(&source), &raw) {
+    if let Err(e) = write_file(file.path(), &raw) {
         return fail(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("failed to update source auth file: {e}"),
         );
     }
+    // Ordinary records among the parsed credentials acquire their own lease below.
+    drop(file);
     let same = |p: &str| {
         let clean = |p: &str| std::path::absolute(p.trim()).ok();
         !p.trim().is_empty() && clean(p) == clean(&source)
@@ -1958,6 +1977,38 @@ fn save_file_backed(
 ) -> Result<(), PatchError> {
     let path = path_of(target).ok_or(PatchError::ConfigBacked)?;
     let existing = std::fs::read(path).ok();
+    if crate::runtime::native_credential_file(target).is_some()
+        && !target.provider.go_eq_fold("codex")
+        && let Some(bytes) = existing.as_deref()
+        && let Ok(mut disk) = serde_json::from_slice::<Map<String, Value>>(bytes)
+    {
+        credentials::normalize_metadata(&mut disk);
+        let mut loaded = target.clone();
+        loaded.metadata = disk;
+        // Go's credential-version comparison excludes some grants and routing fields,
+        // and attributes can shadow a stored API key. A metadata edit cannot restore
+        // these from stale memory after another program changed the shared file.
+        if crate::runtime::credentials_changed(target, &loaded)
+            || ["api_key", "dca_token", "headers", "domain", "base_url", "proxy_url"]
+                .iter()
+                .any(|key| target.metadata.get(*key) != loaded.metadata.get(*key))
+            || !loaded
+                .str("type")
+                .is_some_and(|kind| kind.trim().go_eq_fold(&target.provider))
+        {
+            // A refresh in this process updates both disk and the revision. Keep
+            // that optimistic-concurrency retry ahead of the external-edit refusal.
+            let current = state.rt.store().get(&target.id).ok_or(PatchError::NotFound)?;
+            if current.revision != target.revision {
+                return Err(PatchError::Stale {
+                    current: current.revision,
+                });
+            }
+            return Err(PatchError::Io(
+                "credential changed in another process; retry after it reloads".into(),
+            ));
+        }
+    }
     let held: Option<[u8; 32]> = existing
         .as_deref()
         .map(|b| <sha2::Sha256 as sha2::Digest>::digest(b).into());
@@ -2206,11 +2257,16 @@ fn merge_codex_from_disk(disk: &BTreeMap<String, GoValue>, doc: &mut BTreeMap<St
 
 /// Writes `bytes` as `target`'s file and registers their re-synthesis in its place,
 /// while `target` is still the current record (see [`save_file_backed`]).
-pub(super) fn save_bytes(state: &Management, target: &Credential, bytes: Vec<u8>) -> Result<(), PatchError> {
+pub(super) fn save_bytes(
+    state: &Management,
+    target: &Credential,
+    bytes: Vec<u8>,
+    source: &[u8],
+) -> Result<(), PatchError> {
     let commit = Commit {
         bytes,
         write: true,
-        disk: None,
+        disk: Some(Some(<sha2::Sha256 as sha2::Digest>::digest(source).into())),
         doc: None,
     };
     commit_bytes(state, target, commit)
@@ -2714,7 +2770,7 @@ mod tests {
             registered,
             plugin: true,
         };
-        let committed = crate::runtime::commit_refresh(store, "a.json", &current, fence, &patch, |_| {}).unwrap();
+        let committed = crate::runtime::commit_refresh(store, "a.json", &current, fence, &patch, |_| {}, None).unwrap();
         assert_eq!(committed.metadata["refresh_token"], "r2", "the refresh commits");
         let on_disk: Value = serde_json::from_slice(&std::fs::read(dir.join("a.json")).unwrap()).unwrap();
         assert_eq!(on_disk["refresh_token"], "r2");
@@ -2810,6 +2866,77 @@ mod tests {
 
     fn on_disk(dir: &std::path::Path, file: &str) -> Value {
         serde_json::from_slice(&std::fs::read(dir.join(file)).unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn metadata_edit_refuses_to_overwrite_an_external_native_token_rotation() {
+        let (state, dir) = management(
+            "external-rotation",
+            &[(
+                "a.json",
+                r#"{"type":"claude","access_token":"before","refresh_token":"before-grant"}"#,
+            )],
+        );
+        let current = state.rt.store().get("a.json").unwrap();
+        let mut metadata = current.metadata.clone();
+        metadata.insert("note".into(), "edited".into());
+        for (field, replacement) in [
+            ("dca_token", Value::from("dca:replacement-grant")),
+            ("headers", serde_json::json!({"Authorization":"Bearer replacement"})),
+            ("base_url", Value::from("https://replacement.example")),
+            ("type", Value::from("meta")),
+        ] {
+            let mut external = current.metadata.clone();
+            external.insert(field.into(), replacement);
+            let bytes = serde_json::to_vec(&external).unwrap();
+            std::fs::write(dir.join("a.json"), &bytes).unwrap();
+            assert!(save_file_backed(&state, &current, &metadata, &[]).is_err(), "{field}");
+            assert_eq!(std::fs::read(dir.join("a.json")).unwrap(), bytes);
+        }
+        std::fs::write(
+            dir.join("a.json"),
+            r#"{"type":"claude","access_token":"after","refresh_token":"after-grant"}"#,
+        )
+        .unwrap();
+        assert!(save_file_backed(&state, &current, &metadata, &[]).is_err());
+        assert_eq!(on_disk(&dir, "a.json")["refresh_token"], "after-grant");
+        state
+            .rt
+            .store()
+            .reconcile(credentials::from_auth_dir(&state.rt.config()));
+        let current = state.rt.store().get("a.json").unwrap();
+        let mut metadata = current.metadata.clone();
+        metadata.insert("note".into(), "edited".into());
+        save_file_backed(&state, &current, &metadata, &[]).unwrap();
+        assert_eq!(on_disk(&dir, "a.json")["refresh_token"], "after-grant");
+        assert_eq!(on_disk(&dir, "a.json")["note"], "edited");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn binding_bytes_refuse_an_external_rotation_since_their_read() {
+        let (state, dir) = management(
+            "binding-disk-fence",
+            &[(
+                "a.json",
+                r#"{"type":"codex","access_token":"before","refresh_token":"before-grant"}"#,
+            )],
+        );
+        let current = state.rt.store().get("a.json").unwrap();
+        let source = std::fs::read(dir.join("a.json")).unwrap();
+        let binding =
+            br#"{"type":"codex","access_token":"before","refresh_token":"before-grant","use_siwc":true}"#.to_vec();
+        std::fs::write(
+            dir.join("a.json"),
+            r#"{"type":"codex","access_token":"after","refresh_token":"after-grant"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            save_bytes(&state, &current, binding, &source),
+            Err(PatchError::Stale { .. })
+        ));
+        assert_eq!(on_disk(&dir, "a.json")["refresh_token"], "after-grant");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// Go's store leaves a file whose document is unchanged alone (`jsonEqual`, numbers
@@ -3127,34 +3254,128 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
-    /// A token refresh that commits between an upload's write and its publication
-    /// changed the file: the refreshed credential stays, on disk and in the store.
+    /// Both upload formats wait for a shared refresh lease off the async worker, and
+    /// the explicit replacement stays locked through publication.
     #[tokio::test]
-    async fn a_refresh_between_an_upload_and_its_publication_survives() {
-        use cpa_core::config::credentials::{ParseRequest, Parsed, PluginAuthParser};
-        struct Nothing;
-        impl PluginAuthParser for Nothing {
-            fn parse_auths(&self, _: &ParseRequest<'_>) -> Parsed {
-                Parsed::NotHandled
-            }
-        }
-        let (state, dir) = management(
-            "upload-refresh",
-            &[("a.json", r#"{"type":"claude","access_token":"fake-0"}"#)],
-        );
-        // This thread only: tests sharing the process never see the parser.
-        credentials::with_thread_plugin_auth_parser(Arc::new(Nothing), || {
-            let refreshing = state.clone();
+    async fn uploads_wait_for_shared_credential_lease_through_publication() {
+        use cpa_exec::codex_siwc_bind::CredentialFileLease;
+        for parts in [0, 1, 2] {
+            let (state, dir) = management(
+                "upload-refresh",
+                &[("a.json", r#"{"type":"claude","access_token":"fake-0"}"#)],
+            );
+            let path = dir.join("a.json");
+            let file = CredentialFileLease::acquire(&path).await.unwrap();
+            let check_path = path.clone();
             crate::management::BEFORE_RECONCILE.lock().unwrap().push((
                 state.rt.config().auth_dir.clone(),
-                Box::new(move || refresh(&refreshing, "a.json", "fake-refreshed")),
+                Box::new(move || {
+                    assert!(CredentialFileLease::try_acquire(&check_path).unwrap().is_none());
+                }),
             ));
-            store_file(&state, "a.json", br#"{"type":"claude","access_token":"fake-1"}"#, true).unwrap();
+            let document = r#"{"type":"claude","access_token":"fake-1"}"#;
+            let mut headers = HeaderMap::new();
+            let body = if parts == 0 {
+                document.to_owned()
+            } else {
+                headers.insert(
+                    header::CONTENT_TYPE,
+                    "multipart/form-data; boundary=lease-test".parse().unwrap(),
+                );
+                let mut body = String::new();
+                for name in ["a.json", "b.json"].into_iter().take(parts) {
+                    body.push_str(&format!(
+                        "--lease-test\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{name}\"\r\n\r\n{document}\r\n"
+                    ));
+                }
+                body.push_str("--lease-test--\r\n");
+                body
+            };
+            let worker = state.clone();
+            let (started, wait) = tokio::sync::oneshot::channel();
+            let mut upload = tokio::spawn(async move {
+                started.send(()).unwrap();
+                super::upload(
+                    State(worker),
+                    Uri::from_static("/v8/management/auth-files"),
+                    RawQuery(Some("name=a.json".into())),
+                    headers,
+                    crate::body_limit::Read {
+                        body: Ok(Bytes::from(body)),
+                        prefix: Bytes::new(),
+                    },
+                )
+                .await
+            });
+            wait.await.unwrap();
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), &mut upload)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(on_disk(&dir, "a.json")["access_token"], "fake-0");
+            std::fs::write(file.path(), br#"{"type":"claude","access_token":"fake-refreshed"}"#).unwrap();
+            drop(file);
+            let response = tokio::time::timeout(Duration::from_secs(5), upload)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
             let stored = state.rt.store().get("a.json").unwrap();
             assert_eq!(stored.provider, "claude");
-            assert_eq!(stored.metadata["access_token"], "fake-refreshed");
-            assert_eq!(on_disk(&dir, "a.json")["access_token"], "fake-refreshed");
+            assert_eq!(stored.metadata["access_token"], "fake-1");
+            assert_eq!(on_disk(&dir, "a.json")["access_token"], "fake-1");
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn virtual_status_reads_rotated_tokens_after_waiting_for_shared_lease() {
+        use cpa_exec::codex_siwc_bind::CredentialFileLease;
+        let (state, dir) = management_with(
+            "virtual-status-refresh",
+            &[(
+                "a.json",
+                r#"{"type":"pp","access_token":"old","refresh_token":"old-grant"}"#,
+            )],
+            |credentials| {
+                for credential in credentials {
+                    credential.attributes.insert("plugin_virtual".into(), "true".into());
+                }
+            },
+        );
+        let file = CredentialFileLease::acquire(&dir.join("a.json")).await.unwrap();
+        let worker = state.clone();
+        let (started, wait) = tokio::sync::oneshot::channel();
+        let mut update = tokio::spawn(async move {
+            started.send(()).unwrap();
+            status(
+                State(worker),
+                Ok(FirstJson(Bytes::from_static(br#"{"name":"a.json","disabled":true}"#))),
+            )
+            .await
         });
+        wait.await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut update)
+                .await
+                .is_err()
+        );
+        std::fs::write(
+            file.path(),
+            br#"{"type":"pp","access_token":"rotated","refresh_token":"rotated-grant"}"#,
+        )
+        .unwrap();
+        drop(file);
+        let response = tokio::time::timeout(Duration::from_secs(5), update)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let disk = on_disk(&dir, "a.json");
+        assert_eq!(disk["access_token"], "rotated");
+        assert_eq!(disk["refresh_token"], "rotated-grant");
+        assert_eq!(disk["disabled"], true);
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

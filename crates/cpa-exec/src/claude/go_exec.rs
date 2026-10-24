@@ -571,6 +571,7 @@ pub(super) async fn replay(test: &str, record: &Value) -> Result<Verdict, String
             .collect(),
         metadata: auth["metadata"].as_object().cloned().unwrap_or_default(),
         revision: 0,
+        parsed_by_plugin: false,
         next_refresh_after: None,
     };
     let hooks = crate::proxy::Hooks {
@@ -578,8 +579,15 @@ pub(super) async fn replay(test: &str, record: &Value) -> Result<Verdict, String
         resolve: hosts.iter().map(|h| (h.clone(), upstream.tls)).collect(),
     };
     let executor = ClaudeExecutor::with_hooks(hooks, super::DEFAULT_BASE_URL);
-    if crate::oauth::needs_identity(&credential) && executor.needs_prepare(&credential, &cfg) {
-        // The runtime prepares before dispatch when readiness is PrepareNow.
+    let kind = record["kind"].as_str().unwrap();
+    if matches!(kind, "execute" | "execute_stream")
+        && crate::oauth::needs_identity(&credential)
+        && executor.needs_prepare(&credential, &cfg)
+    {
+        // Supply the generation identity step owned by Rust's runtime. These
+        // recordings call executor methods directly: Go's CountTokens and
+        // countTokensUpstream (claude_executor_tokens.go) do not fetch identity.
+        // Its manager's count preflight is a separate, unrecorded entry point.
         if let Ok(patch) = executor.prepare(&credential, &cfg).await {
             patch.apply(&mut credential.metadata);
         }
@@ -598,7 +606,6 @@ pub(super) async fn replay(test: &str, record: &Value) -> Result<Verdict, String
             ))
         })
         .collect();
-    let kind = record["kind"].as_str().unwrap();
     let source = format(options["source_format"].as_str().unwrap_or_default());
     let execution = metadata["execution_session_id"].as_str().map(str::to_owned);
     let session = Some(cpa_common::session::extract_session_id(

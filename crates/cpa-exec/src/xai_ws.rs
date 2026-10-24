@@ -1137,7 +1137,7 @@ impl XaiExecutor {
         }
         let mut prepared = crate::xai::before_reporter(
             &req.usage,
-            request::prepare(&req, cfg, true, Format::Codex, &self.replay, true).await,
+            request::prepare(credential, &req, cfg, true, Format::Codex, &self.replay, true).await,
         )?;
         let previous = text(&gj::get(&req.body, "previous_response_id")).trim().to_owned();
         if !previous.is_empty() {
@@ -1303,7 +1303,7 @@ impl XaiExecutor {
             drop(slot);
             current.shutdown();
         }
-        let client = self.clients.for_credential(credential, cfg);
+        let client = self.clients.for_credential(credential, cfg)?;
         let (socket, handshake) = dial(&client, target, headers, capture, retry).await?;
         let (sink, stream) = socket.split();
         let conn = Upstream::new(target.clone(), sink, self.ws.pool.write);

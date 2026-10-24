@@ -3,9 +3,9 @@
 //! preparation on top of the shared replay helpers (crate::replay).
 //!
 //! After a complete response with signed thinking and a tool call, the assistant content
-//! is cached per (model family, session); the next request restores it into the matching
-//! assistant turn. Writes are conditional on the generation read, so a slower request
-//! never overwrites newer content.
+//! is cached per (caller, credential, model family, session); the next request restores
+//! it into the matching assistant turn. Writes are conditional on the generation read,
+//! so a slower request never overwrites newer content.
 //!
 //! In Home mode the state lives in Home KV (`cpa:kimi:thinking-replay:*`, crate::home_replay)
 //! as Go writes it. Cache failures only skip replay, as in Go.
@@ -16,7 +16,9 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use cpa_common::json as gj;
+use cpa_core::credential::Credential;
 use cpa_core::exec::{ExecError, ExecRequest};
+use sha2::{Digest, Sha256};
 
 use crate::replay::{MAX_BLOCKS_PER_ENTRY, MAX_BYTES_PER_ENTRY, ReplayTarget, replayable, restore_turn, session_key};
 
@@ -293,9 +295,9 @@ impl Scope {
 
 /// `prepareKimiThinkingReplayRequest`: restores cached content into `req.body` when it
 /// matches the latest assistant turn.
-pub(crate) async fn prepare(cache: &Arc<ReplayCache>, req: &mut ExecRequest) -> Scope {
+pub(crate) async fn prepare(cache: &Arc<ReplayCache>, credential: &Credential, req: &mut ExecRequest) -> Scope {
     let family = model_family(&req.model);
-    let session = session_key(req, &req.body);
+    let session = isolated_session(req, credential, &session_key(req, &req.body));
     let key = if family.trim().is_empty() || session.trim().is_empty() {
         String::new()
     } else {
@@ -344,6 +346,32 @@ pub(crate) async fn prepare(cache: &Arc<ReplayCache>, req: &mut ExecRequest) -> 
         scope.applied = true;
     }
     scope
+}
+
+/// Native signatures belong to the selected account. Session affinity alone does
+/// not protect replay when routing rotates credentials within the same session.
+fn isolated_session(req: &ExecRequest, credential: &Credential, session: &str) -> String {
+    if session.is_empty() || credential.id.is_empty() {
+        return String::new();
+    }
+    let endpoint = crate::kimi::base_url(credential);
+    let mut digest = Sha256::new();
+    for field in [
+        "kimi-replay-scope-v1",
+        req.caller.provider.as_str(),
+        req.caller.principal.as_str(),
+        credential.provider.as_str(),
+        credential.id.as_str(),
+        credential.str("email").unwrap_or_default(),
+        endpoint.as_str(),
+        session,
+    ] {
+        digest.update((field.len() as u64).to_be_bytes());
+        digest.update(field.as_bytes());
+    }
+    // Token refresh and credential revision changes keep the same account's chain.
+    let digest: String = digest.finalize().iter().map(|b| format!("{b:02x}")).collect();
+    format!("isolated:v1:{digest}")
 }
 
 /// `kimiThinkingReplayKVKey`.
@@ -442,6 +470,56 @@ pub(crate) mod tests {
     use super::*;
 
     const CACHED: &str = r#"[{"type":"thinking","thinking":"plan","signature":"sig-1"},{"type":"text","text":"Calling."},{"type":"tool_use","id":"toolu_1","name":"read","input":{"path":"a"}}]"#;
+
+    #[tokio::test]
+    async fn replay_stays_with_selected_credential_through_token_rotation() {
+        const BODY: &str = r#"{"messages":[{"role":"assistant","content":[{"type":"text","text":"Calling."},{"type":"tool_use","id":"toolu_1","name":"read","input":{"path":"a"}}]},{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"ok"}]}]}"#;
+        let fixture = serde_json::json!({
+            "credential": {"type": "kimi", "email": "owner@example.invalid", "access_token": "old-access"},
+            "request": {
+                "source": "claude", "model": "kimi-k3", "body": BODY,
+                "headers": [["session-id", "account-isolation"]]
+            }
+        });
+        let account = crate::kimi_fixture::credential("kimi", &fixture, None);
+        let owner = crate::kimi_fixture::request(&fixture, "caller-a");
+        // Both client-supplied sessions and trusted execution sessions must stay on
+        // the selected account when the pool rotates credentials.
+        for execution in [None, Some("trusted-execution")] {
+            let cache = Arc::new(ReplayCache::default());
+            let mut request = owner.clone();
+            request.execution_session = execution.map(str::to_owned);
+            let first = prepare(&cache, &account, &mut request).await;
+            assert!(!first.applied);
+            first.store_response(format!(r#"{{"content":{CACHED}}}"#).as_bytes());
+
+            let mut refreshed = account.clone();
+            refreshed.metadata.insert("access_token".into(), "new-access".into());
+            refreshed
+                .metadata
+                .insert("refresh_token".into(), "rotated-refresh".into());
+            refreshed.revision += 1;
+            let mut rotated = refreshed.clone();
+            rotated.id = "different-account.json".into();
+            for (credential, expected) in [(&refreshed, true), (&rotated, false), (&account, true)] {
+                let mut next = request.clone();
+                let scope = prepare(&cache, credential, &mut next).await;
+                assert_eq!(
+                    scope.applied, expected,
+                    "execution={execution:?}, credential={}",
+                    credential.id
+                );
+                if expected {
+                    assert_eq!(gj::get(&next.body, "messages.0.content.0.signature").str(), "sig-1");
+                } else {
+                    assert_eq!(next.body, request.body);
+                }
+            }
+            let mut another_auth_provider = request.clone();
+            another_auth_provider.caller.provider = "other-auth-provider".into();
+            assert!(!prepare(&cache, &account, &mut another_auth_provider).await.applied);
+        }
+    }
 
     #[test]
     fn family_shares_k3_variants_only() {

@@ -2230,7 +2230,8 @@ async fn attempt(
             && !refreshed
             && !lease.is_remote()
             && classify::is_unauthorized(error)
-            && let Some(current) = rt.refresh_after_unauthorized(&lease.credential, cfg).await
+            && !policy.error_action(&lease.credential, error).matched
+            && let Some(current) = rt.refresh_after_unauthorized_for_lease(&lease, cfg).await
         {
             refreshed = true;
             if let Some(t) = tracker.take() {

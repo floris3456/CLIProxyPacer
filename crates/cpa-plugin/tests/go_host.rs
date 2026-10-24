@@ -360,6 +360,49 @@ fn same(go: &Value, rust: &Value) -> bool {
     }
 }
 
+/// Keep the recorded Go fixture intact while asserting the one deliberate transport
+/// difference: its ordinary HTTP callback falls back from an unsupported FTP proxy;
+/// Rust must refuse that selected route, just as the profiled callbacks already do.
+fn expected_result(name: &str, index: usize, steps: &[Value]) -> Value {
+    let step = &steps[index];
+    let mut expected = step["result"].clone();
+    let config_index = match (name, index) {
+        ("go-host", 165) => 163,
+        ("go-callbacks-v8035", 10) => 8,
+        _ => return expected,
+    };
+    assert_eq!(steps[config_index]["op"], "apply");
+    let cfg: serde_yaml_ng::Value = serde_yaml_ng::from_str(steps[config_index]["args"].as_str().unwrap()).unwrap();
+    assert_eq!(
+        cfg["requests"]["proxy-url"].as_str(),
+        Some("ftp://user:pw@proxy.invalid:1")
+    );
+    assert_eq!(step["op"], "management");
+    assert_eq!(step["args"]["method"], "POST");
+    assert_eq!(step["args"]["target"], "/v0/management/rec/a/calls");
+    let calls: Value = serde_json::from_str(step["args"]["body"].as_str().unwrap()).unwrap();
+    assert_eq!(calls["calls"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        calls["calls"][2],
+        json!({"method": "host.http.do", "request": {"url": "http://UPSTREAM/status"}})
+    );
+    const GO_FALLBACK: &str =
+        r#"0 {"ok":true,"result":{"StatusCode":404,"Headers":{"Content-Length":["0"]},"Body":""}}"#;
+    const RUST_REFUSAL: &str =
+        r#"0 {"ok":false,"error":{"code":"host_call_failed","message":"pluginhost: invalid proxy transport"}}"#;
+    let body = expected["body"].as_str().unwrap();
+    let parsed: Value = serde_json::from_str(body).unwrap();
+    assert_eq!(parsed["results"].as_array().unwrap().len(), 3);
+    assert_eq!(parsed["results"][2], GO_FALLBACK);
+    let old = serde_json::to_string(GO_FALLBACK).unwrap();
+    let new = serde_json::to_string(RUST_REFUSAL).unwrap();
+    assert_eq!(body.matches(&old).count(), 1);
+    // Preserve every other byte, including Go's string escaping and the two profiled
+    // refusals. A success, different error, or leaked proxy credentials still fails.
+    expected["body"] = body.replacen(&old, &new, 1).into();
+    expected
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rust_host_matches_go_host() {
     let Some(built) = support::built_plugins_for("go_host::rust_host_matches_go_host") else {
@@ -388,14 +431,16 @@ async fn replay(built: &Path, name: &str, fixture: &str) {
     std::fs::create_dir_all(&runner.record_dir).unwrap();
     std::fs::create_dir_all(&runner.auth_dir).unwrap();
     let mut failures = Vec::new();
-    for (i, step) in fixture["steps"].as_array().unwrap().iter().enumerate() {
+    let steps = fixture["steps"].as_array().unwrap();
+    for (i, step) in steps.iter().enumerate() {
         let op = step["op"].as_str().unwrap();
         let got = runner.step(op, &step["args"]).await;
-        if step.get("result").is_some() && !same(&step["result"], &got) {
+        let expected = expected_result(name, i, steps);
+        if step.get("result").is_some() && !same(&expected, &got) {
             failures.push(format!(
                 "step {i} {op} {}\n  {}",
                 step["args"].to_string().chars().take(160).collect::<String>(),
-                first_diff(&step["result"], &got, "")
+                first_diff(&expected, &got, "")
             ));
         }
     }

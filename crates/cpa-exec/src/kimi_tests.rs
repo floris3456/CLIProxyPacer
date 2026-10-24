@@ -269,6 +269,41 @@ async fn claude_delegation_full_wire_parity() {
 }
 
 #[tokio::test]
+async fn every_wire_format_uses_selected_token_without_changing_auth_mode() {
+    for name in [
+        "chat-nonstream-normalize",
+        "responses-nonstream-reorder-suffix",
+        "claude-nonstream-delegated",
+        "claude-count-tokens-upstream",
+    ] {
+        for with_api_key in [false, true] {
+            let fx = fixture("kimi", name);
+            let mock = Mock::start(&fx["responses"]).await;
+            let mut cred = credential("kimi", &fx, Some(("base_url", format!("{}/coding", mock.url))));
+            cred.metadata.insert("access_token".into(), "selected-token".into());
+            cred.attributes
+                .insert("access_token".into(), "inactive-attribute-token".into());
+            if with_api_key {
+                cred.attributes.insert("api_key".into(), "inactive-api-key".into());
+            } else {
+                cred.attributes.remove("api_key");
+            }
+            let _ = downstream(executor().execute(&claude(), &cred, request(&fx, ""), &cfg()).await).await;
+            let captured = mock.captured();
+            assert_eq!(captured.len(), 1, "{name}");
+            // Third-party Claude-compatible endpoints, including Kimi, always use
+            // Bearer; x-api-key is reserved for first-party Anthropic API-key calls.
+            assert_eq!(
+                captured[0].header("Authorization"),
+                Some("Bearer selected-token"),
+                "{name} with_api_key={with_api_key}"
+            );
+            assert!(captured[0].header("X-Api-Key").is_none(), "{name}");
+        }
+    }
+}
+
+#[tokio::test]
 async fn count_tokens_goes_upstream_like_go() {
     let (fx, captured, down) = run("claude-count-tokens-upstream").await;
     assert_same_request(

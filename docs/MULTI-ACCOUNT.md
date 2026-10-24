@@ -52,10 +52,10 @@ When a provider answers 429 (too many requests, or a used-up limit), the proxy r
 - If the provider says when to try again (a `Retry-After` header or a stated reset), the account rests that long, at least 10 seconds, but at most one hour at first ([`max-trusted-cooldown`](CONFIGURATION.md#routing)). Then the next request checks the account; while that check is out, other requests go elsewhere. If it is still limited, the next rest doubles, never past the stated reset. The dashboard shows such an account as "Limited until" the stated reset, with the time of the next check.
 - Without that, the rest starts at one second and doubles on each further 429, up to 30 minutes.
 - An error that says the whole account is out of quota rests the account for every model.
-- A rejected token (401 or 403) rests the account for 30 minutes, and the dashboard marks it "Sign in again" when the sign-in has expired or was revoked.
+- Authentication failures (401 or 403) normally add a 30-minute cooldown. An unhandled credential-level 401 also blocks the rejected native token until recovery, independently of cooldown resets or metadata edits. The dashboard marks expired or revoked sign-ins "Sign in again".
 - A successful request on the account clears its cooldown for that model.
 
-`routing.retry.request-retry` (default 0) adds rounds over the accounts when every attempt in a round failed, and `routing.retry.max-retry-interval` (seconds, default 0) lets the proxy wait for an account to come out of cooldown instead of failing at once. The Reset cooldown button on the Credentials and Quotas pages clears the proxy's own record only; it does not give back any provider limit.
+`routing.retry.request-retry` (default 0) adds rounds over the accounts when every attempt in a round failed, and `routing.retry.max-retry-interval` (seconds, default 0) lets the proxy wait for an account to come out of cooldown instead of failing at once. The Reset cooldown button clears cooldowns, not retained token rejections or provider quota.
 
 The optional [fail over only on 429 preset](CONFIGURATION.md#optional-preset-fail-over-only-on-429) keeps 429 failover for OAuth accounts. It stops ordinary failover after a failed attempt for the listed non-429 statuses. Credential-preparation failures and an enabled `requests.streaming.bootstrap-retries` can still cause another attempt.
 
