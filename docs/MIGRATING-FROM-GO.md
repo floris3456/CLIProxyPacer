@@ -25,7 +25,7 @@ The way back works too. In our tests against fake sign-in servers, Go 6fecc6e li
 
 For a systemd service, replace the binary and keep your config and credential paths. The default Docker image expects `/data/config.yaml` and runs as UID/GID 10001. Update mounts and permissions, or override `--config` and set an accessible `oauth.auth-dir` to keep existing paths. [INSTALL.md](INSTALL.md#docker) covers volume ownership, listen address and management access.
 
-Do not run Go and cliproxy-rs with credentials for the same account at the same time, even from separate copies of the auth directory. Both refresh OAuth tokens. A provider that rotates refresh tokens can invalidate the token held by the other server and force a new sign-in. A copied auth directory is not an isolated test. To try both servers side by side, use a separate test account and a different port. Keep the backup private, and do not assume its refresh tokens remain usable after either server refreshes them.
+Stop Go before switching to cliproxy-rs. Native refreshes now coordinate through a shared credential-file lock, but every writer must use the same file and cooperate with that lock. Copied credentials, independent remote-store caches and other CLIs that ignore the lock can still race. Use the same canonical file path when sharing with Go v8.0.35. Empty `.json.lock` files are coordination sidecars: do not delete them while writers are running. To test independently, use a separate account and port. Keep backups private; their refresh tokens may become invalid after a rotation.
 
 ## Command-line flags
 

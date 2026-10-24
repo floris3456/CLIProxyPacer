@@ -1992,8 +1992,8 @@ fn preserved_thinking_binding(mut body: String) -> String {
         }
     }
     let mut signed_history = false;
-    rawjson::get(&body, "messages").each(|_, message| {
-        message.get("content").each(|_, block| {
+    rawjson::get(&body, "messages").each_value(|message| {
+        message.get("content").each_value(|block| {
             signed_history = match block.get("type").str().trim() {
                 "thinking" => !block.get("signature").str().trim().is_empty(),
                 "redacted_thinking" => !block.get("data").str().trim().is_empty(),

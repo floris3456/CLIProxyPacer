@@ -2661,7 +2661,7 @@ async fn xai_login_polls_the_device_flow_and_saves_the_credential() {
     let names: Vec<String> = std::fs::read_dir(&auth)
         .unwrap()
         .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-        .filter(|n| n.starts_with("xai-"))
+        .filter(|n| n.starts_with("xai-") && n.ends_with(".json"))
         .collect();
     assert_eq!(names.len(), 1, "{names:?}");
     let path = auth.join(&names[0]);
@@ -3437,7 +3437,7 @@ async fn kimi_device_login_saves_and_a_cancelled_one_does_not() {
     assert_eq!(
         names
             .iter()
-            .filter(|n| n.starts_with("kimi-") && !n.starts_with("kimi-ai"))
+            .filter(|n| n.starts_with("kimi-") && !n.starts_with("kimi-ai") && n.ends_with(".json"))
             .count(),
         1,
         "{names:?}"

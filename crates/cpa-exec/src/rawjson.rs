@@ -111,6 +111,13 @@ impl<'a> Value<'a> {
         self.res.each(|k, v| f(Value::new(src, k), Value::new(src, v)));
     }
 
+    /// Visit values without formatting unused array-index keys. Keeps ForEach's
+    /// scalar, duplicate-member and early-exit behavior.
+    pub(crate) fn each_value(&self, mut f: impl FnMut(Value<'a>) -> bool) {
+        let src = self.src();
+        self.res.each(|_, v| f(Value::new(src, v)));
+    }
+
     /// `Result.Array()`: one allocation, as the gjson crate made, rather than one for
     /// the port's results and another for these.
     pub(crate) fn array(&self) -> Vec<Value<'a>> {
@@ -233,6 +240,34 @@ pub(crate) fn string(json: &str, path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn value_visits_preserve_raw_data_and_early_exit() {
+        for text in [
+            "",
+            "null",
+            "17",
+            r#""escaped\u0061""#,
+            r#"[null,{"type":"redacted_thinking","data":"opaque\u002b/=="},{"type":"thinking","thinking":"","signature":"sig"}]"#,
+            r#"{"duplicate":1,"duplicate":2,"escaped\u0061":[3]}"#,
+        ] {
+            for limit in [1, usize::MAX] {
+                let value = parse(text);
+                let snapshot = |v: Value<'_>| (v.kind(), v.json().to_owned(), v.str().to_owned());
+                let mut expected = Vec::new();
+                value.each(|_, v| {
+                    expected.push(snapshot(v));
+                    expected.len() < limit
+                });
+                let mut actual = Vec::new();
+                value.each_value(|v| {
+                    actual.push(snapshot(v));
+                    actual.len() < limit
+                });
+                assert_eq!(actual, expected, "{text}: limit {limit}");
+            }
+        }
+    }
 
     #[test]
     fn sjson_cases_generated_by_go_match() {
